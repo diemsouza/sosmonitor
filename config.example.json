@@ -3,6 +3,7 @@
   "check_interval_minutes": 1,
   "disk_path": "/",
   "send_every_check": true,
+  "sustain_checks": 1,
   "thresholds": {
     "70": "{metric} at {value}%",
     "80": "{metric} at {value}% (WARNING)",
@@ -10,6 +11,10 @@
     "100": "{metric} at {value}% (AT LIMIT)"
   },
   "recovery_message": "{metric} at {value}% (BACK TO NORMAL)",
+  "top_processes": {
+    "enabled": true,
+    "count": 3
+  },
   "webhook": {
     "enabled": false,
     "url": "",

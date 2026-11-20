@@ -69,6 +69,7 @@ Created automatically on the first run (with `chmod 600`, since it holds passwor
   "check_interval_minutes": 1,
   "disk_path": "/",
   "send_every_check": true,
+  "sustain_checks": 1,
   "thresholds": {
     "70": "{metric} at {value}%",
     "80": "{metric} at {value}% (WARNING)",
@@ -76,6 +77,10 @@ Created automatically on the first run (with `chmod 600`, since it holds passwor
     "100": "{metric} at {value}% (AT LIMIT)"
   },
   "recovery_message": "{metric} at {value}% (BACK TO NORMAL)",
+  "top_processes": {
+    "enabled": true,
+    "count": 3
+  },
   "webhook": {
     "enabled": false,
     "url": "",
@@ -100,8 +105,10 @@ Created automatically on the first run (with `chmod 600`, since it holds passwor
 | `check_interval_minutes` | How often cron runs the check (used by `install`, 1 to 59)                                                                                                                                            |
 | `disk_path`              | Partition to measure (`/`, `/home`, `C:\` ...)                                                                                                                                                        |
 | `send_every_check`       | `true`: the webhook receives the metrics on every check. `false`: only when there is an alert. Email is only ever sent for alerts                                                                     |
+| `sustain_checks`         | How many consecutive checks a metric must stay at or above a level before the alert is sent. `1` (default) alerts on the first check. Raise it (e.g. `3`) on noisy servers. Recovery is never delayed                |
 | `thresholds`             | Levels in % and the message for each one. They apply to CPU, memory and disk. Your object **replaces** the default list, so include every level you want (e.g. add `"50"` and keep `"70"`, `"80"`...) |
 | `recovery_message`       | Sent when a metric goes back below the lowest level                                                                                                                                                   |
+| `top_processes`          | `enabled` (default `true`) and `count` (default `3`): list the top CPU or memory consumers in the alert, only when that metric alerts                                                                                  |
 | `webhook`                | `url` receives a JSON `POST`; `token`, if set, goes in the header named by `token_header` (default `X-Monitor-Token`; change it to e.g. `X-Token` or `Authorization` if your service requires)        |
 | `email`                  | SMTP settings. Port 465 uses SSL; other ports use STARTTLS when the server offers it. For Gmail, use an [app password](https://myaccount.google.com/apppasswords). `to` is a list                     |
 
@@ -114,6 +121,8 @@ SOSMonitor remembers the last level of each metric (in `sosmonitor_state.json`) 
 - **Going up is immediate.** A value of 72% puts you at level 70, and a value of 85% at level 80.
 - **Going down needs a 5-point margin.** A level is kept until the value falls 5 points below it. This keeps a value that hovers around a threshold from sending an alert/recovery pair on every check.
 - **No repeats.** Staying at the same level for hours sends nothing.
+- **CPU is an average, not a snapshot.** Each check reports the average CPU use since the previous check (SOSMonitor keeps the CPU counters in the state file). That is why it matches the graph in your host's panel, and why a short burst of another job at the moment cron fires doesn't trigger a false alert. The first check after install, or after a reboot, takes a 1-second sample instead.
+- **Optionally, alert only when it persists.** With `"sustain_checks": 3`, a metric has to be at or above a level for 3 checks in a row before the alert goes out. The default is `1`, because the interval average already removes the spikes; use it as a knob for noisy servers.
 
 Example with levels 70 and 80:
 
@@ -127,6 +136,31 @@ Example with levels 70 and 80:
 | 6     | 77%   | 80    | – (still within 80 − 5)           |
 | 7     | 74%   | 70    | **"CPU at 74%"**                  |
 | 8     | 64%   | 0     | **"CPU at 64% (BACK TO NORMAL)"** |
+
+### The alert message
+
+The title shows **only the most severe alert** (highest level, ties broken by the highest value), plus a counter if there are others. With CPU at 75% and memory at 85%:
+
+```
+[SOSMonitor] MY-SERVER: Memory at 85% (WARNING) (+1 more)
+
+Server: MY-SERVER
+Time: 2026-11-20T18:05:03+00:00
+
+Alerts:
+  - Memory at 85% (WARNING)
+  - CPU at 75%
+
+Top processes by memory:
+  1. php-fpm  8.2% (1.3 GB)
+  2. mysqld   6.1% (1.0 GB)
+  3. node     2.4% (395 MB)
+
+Current metrics:
+  CPU 75% | MEMORY 85% | DISK 54%
+```
+
+The top processes are looked up only when a CPU or memory alert goes out (never on quiet checks, never for disk). Memory ranks by current RSS; CPU is measured over one second. Only the command name is shown, never its arguments, since they can contain passwords. On hosts that hide other users' processes the list may be short or missing, and the alert is sent anyway.
 
 Also:
 
@@ -174,12 +208,18 @@ Also:
       "message": "CPU at 83% (WARNING)"
     }
   ],
+  "top_processes": {
+    "cpu": [
+      { "name": "php-fpm", "percent": 62.5 },
+      { "name": "mysqld", "percent": 14.0 }
+    ]
+  },
   "message_title": "[SOSMonitor] MY-SERVER: CPU at 83% (WARNING)",
-  "message_body": "Server: MY-SERVER (web-01)\nTime:   2026-11-19T20:15:00-03:00\n\n- CPU at 83% (WARNING)\n\nCurrent metrics:\n  CPU      83%\n  MEMORY   61%\n  DISK     48%\n  LOAD     1m=1.2 5m=0.9 15m=0.7 CPUs=2\n"
+  "message_body": "Server: MY-SERVER\nTime: 2026-11-19T20:15:00-03:00\n\nAlerts:\n  - CPU at 83% (WARNING)\n\nTop processes by CPU:\n  1. php-fpm  62.5%\n  2. mysqld   14.0%\n\nCurrent metrics:\n  CPU 83% | MEMORY 61% | DISK 48% | LOAD 1m=1.2 5m=0.9 15m=0.7 CPUs=2\n"
 }
 ```
 
-`message_title` and `message_body` are the same text as the email subject and body, ready to forward unchanged to WhatsApp, Telegram, Slack or any chat tool. On checks without alerts (sent only when `send_every_check` is `true`), `alerts` is an empty list and both message fields are empty strings, so in n8n you can filter on `message_title != ""`. The `test` command fills them and adds `"test": true`.
+`message_title` and `message_body` are the same text as the email subject and body, ready to forward unchanged to WhatsApp, Telegram, Slack or any chat tool. On checks without alerts (sent only when `send_every_check` is `true`), `alerts` is an empty list and both message fields are empty strings, so in n8n you can filter on `message_title != ""`. `top_processes` (`cpu` and/or `memory` lists; memory entries also have `rss_bytes`) is present only when there is something to report. The `test` command fills the message fields and adds `"test": true`.
 
 ## Platforms
 
@@ -200,7 +240,7 @@ If your host has no `crontab` command but has a cron panel (common on managed ho
 | File                    | Content                                                                                                                             |
 | ----------------------- | ----------------------------------------------------------------------------------------------------------------------------------- |
 | `sosmonitor.log`        | One JSON line per check (metrics, alerts, delivery result). Rotates to `.log.1` at 5 MB, keeping one old file (about 10 MB at most) |
-| `sosmonitor_state.json` | Last level of each metric                                                                                                           |
+| `sosmonitor_state.json` | Last level of each metric, the `sustain_checks` counters and the CPU counters used for the next average                           |
 | `.sosmonitor.lock`      | Prevents two checks from running at the same time                                                                                   |
 
 ## Updating

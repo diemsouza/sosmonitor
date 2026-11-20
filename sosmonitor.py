@@ -40,7 +40,7 @@ try:
 except ImportError:
     psutil = None
 
-VERSION = "0.1.0"
+VERSION = "0.2.0"
 SCRIPT = Path(__file__).resolve()
 CRON_MARK = "# sosmonitor"
 LOG_FILE = "sosmonitor.log"
@@ -51,12 +51,15 @@ TIMEOUT = 15
 METRIC_LABELS = {"cpu": "CPU", "memory": "Memory", "disk": "Disk"}
 HYSTERESIS = 5  # points a value must fall below a level before it drops
 TASK_NAME = "SOSMonitor"  # Windows Task Scheduler
+TOP_TIMEOUT = 5  # seconds a top-processes lookup may take, at most
+TOP_NAME_WIDTH = 20
 
 DEFAULTS: Dict[str, Any] = {
     "server_name": "SOSMONITOR",
     "check_interval_minutes": 1,
     "disk_path": "/",
     "send_every_check": True,
+    "sustain_checks": 1,
     "thresholds": {
         "70": "{metric} at {value}%",
         "80": "{metric} at {value}% (WARNING)",
@@ -64,6 +67,7 @@ DEFAULTS: Dict[str, Any] = {
         "100": "{metric} at {value}% (AT LIMIT)",
     },
     "recovery_message": "{metric} at {value}% (BACK TO NORMAL)",
+    "top_processes": {"enabled": True, "count": 3},
     "webhook": {"enabled": False, "url": "", "token": "", "token_header": "X-Monitor-Token"},
     "email": {
         "enabled": False,
@@ -140,31 +144,58 @@ def file_in(cfg: dict, name: str) -> Path:
 # METRICS
 # ============================================================
 
-def _read_proc_stat() -> Optional[Tuple[int, int]]:
+def read_cpu_counters() -> Optional[Tuple[float, float]]:
+    """Cumulative (busy, total) CPU time of the whole system, or None."""
+    if psutil:
+        try:
+            times = psutil.cpu_times()
+            # guest times are already counted inside user/nice
+            total = sum(v for k, v in times._asdict().items() if not k.startswith("guest"))
+            idle = times.idle + getattr(times, "iowait", 0.0)
+            return total - idle, total
+        except (OSError, AttributeError):
+            return None
+
     try:
         with open("/proc/stat", encoding="utf-8") as file:
             values = [int(x) for x in file.readline().split()[1:]]
         idle = values[3] + (values[4] if len(values) > 4 else 0)
-        return idle, sum(values[:8])
+        total = sum(values[:8])
+        return total - idle, total
     except (OSError, ValueError, IndexError):
         return None
 
 
-def get_cpu_usage(sample_seconds: float = 1.0) -> Optional[float]:
-    if psutil:
-        return round(psutil.cpu_percent(interval=sample_seconds), 1)
+def _valid_sample(sample: Any) -> bool:
+    return (isinstance(sample, dict)
+            and all(isinstance(sample.get(key), (int, float)) for key in ("busy", "total")))
 
-    first = _read_proc_stat()
-    if first is None:
-        return None
-    time.sleep(sample_seconds)
-    second = _read_proc_stat()
+
+def measure_cpu(previous: Optional[dict]) -> Tuple[Optional[float], Optional[dict]]:
+    """
+    CPU % averaged over the whole time since the previous run, from cumulative
+    counters kept in the state file. Without a usable previous sample (first
+    run, deleted state, counters reset by a reboot) it falls back to a 1-second
+    sample. Returns (percent, new sample); (None, None) when CPU is unavailable.
+    """
+    current = read_cpu_counters()
+    if current is None:
+        return None, None
+    sample = {"busy": current[0], "total": current[1], "time": time.time()}
+
+    if _valid_sample(previous):
+        busy = current[0] - previous["busy"]
+        total = current[1] - previous["total"]
+        if total > 0 and busy >= 0:
+            return round(min(100.0, 100.0 * busy / total), 1), sample
+
+    time.sleep(1)
+    second = read_cpu_counters()
     if second is None:
-        return None
-
-    idle = second[0] - first[0]
-    total = second[1] - first[1]
-    return round(100.0 * (1 - idle / total), 1) if total > 0 else 0.0
+        return None, None
+    busy, total = second[0] - current[0], second[1] - current[1]
+    percent = round(min(100.0, max(0.0, 100.0 * busy / total)), 1) if total > 0 else 0.0
+    return percent, {"busy": second[0], "total": second[1], "time": time.time()}
 
 
 def get_memory_usage() -> Optional[dict]:
@@ -233,8 +264,7 @@ def get_load_average() -> Optional[dict]:
     }
 
 
-def collect_metrics(cfg: dict) -> dict:
-    cpu = get_cpu_usage()
+def collect_metrics(cfg: dict, cpu: Optional[float] = None) -> dict:
     readings = {
         "cpu": {"percent": cpu} if cpu is not None else None,
         "memory": get_memory_usage(),
@@ -266,29 +296,60 @@ def format_message(template: str, server: str, metric: str, value: Any) -> str:
 
 
 def load_state(cfg: dict) -> dict:
+    """{"levels": ..., "pending": ..., "cpu_sample": ...}. A state file from
+    before 0.2.0 holds only the flat levels; it is read as `levels`."""
     try:
-        return json.loads(file_in(cfg, STATE_FILE).read_text(encoding="utf-8"))
+        raw = json.loads(file_in(cfg, STATE_FILE).read_text(encoding="utf-8"))
     except (OSError, json.JSONDecodeError):
-        return {}
+        raw = {}
+    if not isinstance(raw, dict):
+        raw = {}
+
+    if "levels" not in raw and "pending" not in raw and "cpu_sample" not in raw:
+        raw = {"levels": raw}  # old flat format
+    levels = raw.get("levels") if isinstance(raw.get("levels"), dict) else {}
+    pending = raw.get("pending") if isinstance(raw.get("pending"), dict) else {}
+    return {
+        "levels": {k: v for k, v in levels.items() if isinstance(v, int)},
+        "pending": {k: v for k, v in pending.items()
+                    if isinstance(v, dict) and isinstance(v.get("level"), int)
+                    and isinstance(v.get("count"), int)},
+        "cpu_sample": raw.get("cpu_sample") if _valid_sample(raw.get("cpu_sample")) else None,
+    }
 
 
 def save_state(cfg: dict, state: dict) -> None:
     path = file_in(cfg, STATE_FILE)
     tmp = path.with_name(path.name + ".tmp")
+    data = {key: value for key, value in state.items() if value is not None}
     try:
-        tmp.write_text(json.dumps(state, indent=2), encoding="utf-8")
+        tmp.write_text(json.dumps(data, indent=2), encoding="utf-8")
         tmp.replace(path)
     except OSError as error:
         print(f"state write failed: {error}", file=sys.stderr)
 
 
-def build_alerts(cfg: dict, metrics: dict, previous_state: dict) -> Tuple[List[dict], dict]:
+def sustain_checks(cfg: dict) -> int:
+    try:
+        return max(1, int(cfg["sustain_checks"]))
+    except (TypeError, ValueError):
+        return 1
+
+
+def build_alerts(cfg: dict, metrics: dict, previous_state: dict,
+                 pending: Optional[dict] = None) -> Tuple[List[dict], dict]:
     """
-    An alert goes out only when a metric changes threshold level. Rising is
-    immediate; a level is kept until the value falls HYSTERESIS points below
-    it, so a value hovering around a threshold does not flap.
+    `previous_state` is the last level per metric. An alert goes out only when
+    a metric changes threshold level. Rising is immediate (or, with
+    sustain_checks N > 1, after N consecutive checks at that level or higher,
+    counted in `pending`, which is updated in place). A level is kept until the
+    value falls HYSTERESIS points below it, so a value hovering around a
+    threshold does not flap; dropping is never delayed.
     """
     messages = dict(cfg["thresholds"])
+    needed = sustain_checks(cfg)
+    if pending is None:
+        pending = {}
     alerts: List[dict] = []
     new_state = dict(previous_state)
 
@@ -303,6 +364,20 @@ def build_alerts(cfg: dict, metrics: dict, previous_state: dict) -> Tuple[List[d
             current = max((level for level in messages
                            if level <= previous and value >= level - HYSTERESIS), default=0)
 
+        if current > previous:
+            streak = pending.get(name)
+            if streak and current >= streak["level"]:
+                streak["count"] += 1
+            else:
+                streak = pending[name] = {"level": current, "count": 1}
+            # Kept after firing: if delivery fails the level does not advance
+            # and the next check fires again at once. Once it advances,
+            # current == previous and the entry is dropped below.
+            if streak["count"] < needed:
+                current = previous
+        else:
+            pending.pop(name, None)
+
         if current != previous:
             template = messages[current] if current else cfg["recovery_message"]
             alerts.append({
@@ -316,6 +391,130 @@ def build_alerts(cfg: dict, metrics: dict, previous_state: dict) -> Tuple[List[d
         new_state[name] = current
 
     return alerts, new_state
+
+
+# ============================================================
+# TOP PROCESSES (only collected when there is an alert)
+# ============================================================
+
+def _clean_name(name: Any) -> str:
+    """Command name only, never arguments (they can hold passwords and tokens)."""
+    parts = os.path.basename(str(name or "").strip()).split()
+    return parts[0][:TOP_NAME_WIDTH] if parts else ""
+
+
+def top_memory(count: int) -> List[dict]:
+    """Largest processes by RSS (instantaneous)."""
+    deadline = time.monotonic() + TOP_TIMEOUT
+    rows: List[Tuple[str, int]] = []
+
+    if psutil:
+        total = psutil.virtual_memory().total
+        for proc in psutil.process_iter(["name", "memory_info"]):
+            if time.monotonic() > deadline:
+                break
+            info = proc.info
+            if info.get("memory_info") is not None and _clean_name(info.get("name")):
+                rows.append((_clean_name(info["name"]), info["memory_info"].rss))
+    else:
+        result = subprocess.run(["ps", "-eo", "pid,comm,%mem,rss", "--sort=-rss"],
+                                capture_output=True, text=True, timeout=3)
+        if result.returncode != 0:
+            return []
+        total = (get_memory_usage() or {}).get("total_bytes", 0)
+        for line in result.stdout.splitlines()[1:]:
+            fields = line.split()
+            if len(fields) < 4 or not fields[-1].isdigit():
+                continue
+            name = _clean_name(" ".join(fields[1:-2]))
+            if name:
+                rows.append((name, int(fields[-1]) * 1024))
+
+    if not total:
+        return []
+    rows.sort(key=lambda row: row[1], reverse=True)
+    return [{"name": name, "percent": round(100.0 * rss / total, 1), "rss_bytes": rss}
+            for name, rss in rows[:count]]
+
+
+def _proc_cpu_ticks() -> Dict[int, Tuple[str, int]]:
+    """{pid: (name, utime+stime in clock ticks)} from /proc (Linux)."""
+    ticks: Dict[int, Tuple[str, int]] = {}
+    for entry in os.listdir("/proc"):
+        if not entry.isdigit():
+            continue
+        try:
+            with open(f"/proc/{entry}/stat", encoding="utf-8", errors="replace") as file:
+                text = file.read()
+            name = text[text.index("(") + 1:text.rindex(")")]
+            fields = text[text.rindex(")") + 2:].split()
+            ticks[int(entry)] = (name, int(fields[11]) + int(fields[12]))
+        except (OSError, ValueError, IndexError):
+            continue  # process gone or not readable
+    return ticks
+
+
+def top_cpu(count: int) -> List[dict]:
+    """Biggest CPU consumers over a 1-second window (not `ps %cpu`, which is a
+    lifetime average)."""
+    deadline = time.monotonic() + TOP_TIMEOUT
+    rows: List[Tuple[str, float]] = []
+
+    if psutil:
+        procs = []
+        for proc in psutil.process_iter(["name"]):
+            try:
+                proc.cpu_percent(None)
+                procs.append(proc)
+            except psutil.Error:
+                continue
+        time.sleep(1)
+        for proc in procs:
+            if time.monotonic() > deadline:
+                break
+            try:
+                rows.append((_clean_name(proc.info.get("name")), proc.cpu_percent(None)))
+            except psutil.Error:
+                continue
+    else:
+        first = _proc_cpu_ticks()
+        started = time.monotonic()
+        time.sleep(1)
+        second = _proc_cpu_ticks()
+        elapsed = max(time.monotonic() - started, 0.001)
+        hertz = os.sysconf("SC_CLK_TCK")
+        for pid, (name, ticks) in second.items():
+            if pid in first:
+                rows.append((_clean_name(name), 100.0 * (ticks - first[pid][1]) / hertz / elapsed))
+
+    rows = [(name, percent) for name, percent in rows if name and percent > 0]
+    rows.sort(key=lambda row: row[1], reverse=True)
+    return [{"name": name, "percent": round(percent, 1)} for name, percent in rows[:count]]
+
+
+def collect_top_processes(cfg: dict, alerts: List[dict]) -> Dict[str, List[dict]]:
+    """Top consumers for the metrics that alerted (CPU and memory only).
+    Every failure is swallowed: the alert goes out without the list."""
+    settings = cfg["top_processes"]
+    if not settings.get("enabled") or not alerts:
+        return {}
+    try:
+        count = max(1, int(settings.get("count", 3)))
+    except (TypeError, ValueError):
+        count = 3
+
+    finders = {"cpu": top_cpu, "memory": top_memory}
+    found: Dict[str, List[dict]] = {}
+    for alert in alerts:
+        name = alert["metric"]
+        if name in finders and alert["threshold"] > 0 and name not in found:
+            try:
+                rows = finders[name](count)
+            except Exception:  # hidepid, no ps, permissions, anything
+                rows = []
+            if rows:
+                found[name] = rows
+    return found
 
 
 # ============================================================
@@ -346,20 +545,49 @@ def send_webhook(webhook: dict, payload: dict) -> Tuple[bool, str]:
         return False, f"connection error: {error}"
 
 
-def build_message(payload: dict) -> Tuple[str, str]:
-    """Human-readable (title, body) of the alerts; ("", "") when there are none.
-    Single source for the email, the webhook message fields and `test` output."""
-    messages = [alert["message"] for alert in payload["alerts"]]
-    if not messages:
-        return "", ""
-    subject = f"[SOSMonitor] {payload['server']}: " + "; ".join(messages)
+def human_bytes(size: float) -> str:
+    for unit in ("B", "KB", "MB", "GB"):
+        if size < 1024 or unit == "GB":
+            return f"{size:.0f} {unit}" if unit in ("B", "KB", "MB") else f"{size:.1f} {unit}"
+        size /= 1024
+    return ""
 
-    lines = [f"Server: {payload['server']} ({payload['hostname']})",
-             f"Time:   {payload['timestamp']}", ""]
-    lines += [f"- {message}" for message in messages]
-    lines += ["", "Current metrics:"]
-    lines += [f"  {line}" for line in metric_lines(payload["metrics"])]
-    return subject, "\n".join(lines) + "\n"
+
+def top_process_lines(top: dict) -> List[str]:
+    lines: List[str] = []
+    for metric, rows in top.items():
+        lines += ["", f"Top processes by {'CPU' if metric == 'cpu' else 'memory'}:"]
+        width = max(len(row["name"]) for row in rows)
+        for number, row in enumerate(rows, 1):
+            detail = f"{row['percent']}%"
+            if "rss_bytes" in row:
+                detail += f" ({human_bytes(row['rss_bytes'])})"
+            lines.append(f"  {number}. {row['name']:<{width}}  {detail}")
+    return lines
+
+
+def build_message(payload: dict) -> Tuple[str, str]:
+    """
+    Human-readable (title, body) of the alerts; ("", "") when there are none.
+    The ONLY place this text is built: email, webhook message fields and `test`.
+    The title names just the most severe alert (highest level, then highest
+    value) plus a "(+N more)" counter; the body lists them all.
+    """
+    alerts = payload["alerts"]
+    if not alerts:
+        return "", ""
+
+    worst = max(alerts, key=lambda a: (a["threshold"], a["value"]))
+    title = f"[SOSMonitor] {payload['server']}: {worst['message']}"
+    if len(alerts) > 1:
+        title += f" (+{len(alerts) - 1} more)"
+
+    lines = [f"Server: {payload['server']}", f"Time: {payload['timestamp']}",
+             "", "Alerts:"]
+    lines += [f"  - {alert['message']}" for alert in alerts]
+    lines += top_process_lines(payload.get("top_processes", {}))
+    lines += ["", "Current metrics:", "  " + " | ".join(metric_items(payload["metrics"]))]
+    return title, "\n".join(lines) + "\n"
 
 
 def send_email(email: dict, payload: dict) -> Tuple[bool, str]:
@@ -430,18 +658,28 @@ def now_iso() -> str:
     return datetime.now(timezone.utc).astimezone().isoformat(timespec="seconds")
 
 
-def metric_lines(metrics: dict) -> List[str]:
-    lines = []
+def metric_items(metrics: dict) -> List[str]:
+    items = []
     for name, data in metrics.items():
         if name == "load":
-            lines.append(f"LOAD     1m={data['1m']} 5m={data['5m']} "
+            items.append(f"LOAD 1m={data['1m']} 5m={data['5m']} "
                          f"15m={data['15m']} CPUs={data['cpu_count']}")
         else:
-            lines.append(f"{name.upper():<8} {int(data['percent'] + 0.5)}%")
+            items.append(f"{name.upper()} {int(data['percent'] + 0.5)}%")
+    return items
+
+
+def metric_lines(metrics: dict) -> List[str]:
+    """One line per metric, for the console summary."""
+    lines = []
+    for item in metric_items(metrics):
+        label, rest = item.split(" ", 1)
+        lines.append(f"{label:<8} {rest}")
     return lines
 
 
-def build_payload(cfg: dict, metrics: dict, alerts: list) -> dict:
+def build_payload(cfg: dict, metrics: dict, alerts: list,
+                  top_processes: Optional[dict] = None) -> dict:
     payload = {
         "server": cfg["server_name"],
         "hostname": socket.gethostname(),
@@ -450,6 +688,8 @@ def build_payload(cfg: dict, metrics: dict, alerts: list) -> dict:
         "metrics": metrics,
         "alerts": alerts,
     }
+    if top_processes:
+        payload["top_processes"] = top_processes
     payload["message_title"], payload["message_body"] = build_message(payload)
     return payload
 
@@ -467,9 +707,12 @@ def write_log(cfg: dict, record: dict) -> None:
 
 def run_once(cfg: dict) -> None:
     started = time.monotonic()
-    metrics = collect_metrics(cfg)
-    alerts, new_state = build_alerts(cfg, metrics, load_state(cfg))
-    payload = build_payload(cfg, metrics, alerts)
+    state = load_state(cfg)
+    cpu_percent, cpu_sample = measure_cpu(state["cpu_sample"])
+    metrics = collect_metrics(cfg, cpu_percent)
+    pending = dict(state["pending"])
+    alerts, levels = build_alerts(cfg, metrics, state["levels"], pending)
+    payload = build_payload(cfg, metrics, alerts, collect_top_processes(cfg, alerts))
     delivered, results = deliver(cfg, payload)
 
     write_log(cfg, {
@@ -481,15 +724,22 @@ def run_once(cfg: dict) -> None:
         "duration_seconds": round(time.monotonic() - started, 2),
     })
 
-    # If every channel failed, keep the old state so the next run retries.
-    if delivered:
-        save_state(cfg, new_state)
+    # Two write rules: levels advance only if a channel succeeded (a failed
+    # alert is retried next run); the CPU sample and pending counters are
+    # saved on every run, since they are not tied to delivery.
+    save_state(cfg, {
+        "levels": levels if delivered else state["levels"],
+        "pending": pending,
+        "cpu_sample": cpu_sample or state["cpu_sample"],
+    })
 
     print(f"SOSMonitor | {cfg['server_name']} | {payload['timestamp']}")
     for line in metric_lines(metrics):
         print(f"  {line}")
     for alert in alerts:
         print(f"  ALERT: {alert['message']}")
+    for line in top_process_lines(payload.get("top_processes", {})):
+        print(f"  {line}" if line else "")
     for channel, result in results.items():
         print(f"  {channel}: {result}")
 
@@ -502,7 +752,10 @@ def run_test(cfg: dict) -> int:
         "previous_threshold": 0,
         "message": "SOSMonitor test",
     }
-    payload = build_payload(cfg, collect_metrics(cfg), [alert])
+    # Ask for the top lists too, so `test` shows whether they work on this host.
+    probe = [{"metric": m, "threshold": 1} for m in ("cpu", "memory")]
+    payload = build_payload(cfg, collect_metrics(cfg, measure_cpu(None)[0]), [alert],
+                            collect_top_processes(cfg, probe))
     payload["test"] = True
 
     print(payload["message_title"])

@@ -184,7 +184,7 @@ class EmailFormatTests(unittest.TestCase):
     def test_subject_and_body(self):
         subject, body = sm.build_message(payload(ALERT))
         self.assertEqual(subject, "[SOSMonitor] S: CPU at 95% (CRITICAL)")
-        self.assertIn("CPU      95%", body)
+        self.assertIn("CPU 95%", body)
 
 
 class ConfigTests(unittest.TestCase):
@@ -354,10 +354,17 @@ class RunTestCommandTests(unittest.TestCase):
         code, out, hook = self.run_test(make_cfg())
         self.assertEqual(code, 2)
         self.assertIn("[SOSMonitor] S: SOSMonitor test", out)
-        self.assertIn("- SOSMonitor test", out)
-        self.assertIn("CPU      12%", out)
+        self.assertIn("  - SOSMonitor test", out)
+        self.assertIn("CPU 12%", out)
         self.assertIn("No channel enabled", out)
         hook.assert_not_called()
+
+    def test_shows_top_processes_when_available(self):
+        top = {"memory": [{"name": "php-fpm", "percent": 8.2, "rss_bytes": 1395864371}]}
+        with mock.patch.object(sm, "collect_top_processes", return_value=top):
+            code, out, _ = self.run_test(make_cfg())
+        self.assertIn("Top processes by memory:", out)
+        self.assertIn("php-fpm", out)
 
     def test_prints_message_before_results(self):
         code, out, hook = self.run_test(make_cfg(webhook=True))
@@ -487,6 +494,371 @@ class ShortcutTests(unittest.TestCase):
         with mock.patch.object(sm, "cmd_install", return_value=0) as install:
             cli("-c", str(config), "install", "--no-shortcut")
         self.assertIs(install.call_args.kwargs["shortcut"], False)
+
+
+def two_alerts():
+    return [
+        {"metric": "cpu", "value": 75.0, "threshold": 70, "previous_threshold": 0,
+         "message": "CPU at 75%"},
+        {"metric": "memory", "value": 85.0, "threshold": 80, "previous_threshold": 0,
+         "message": "Memory at 85% (WARNING)"},
+    ]
+
+
+class CpuTests(unittest.TestCase):
+    def measure(self, previous, *reads):
+        with mock.patch.object(sm, "read_cpu_counters", side_effect=list(reads)), \
+                mock.patch.object(sm.time, "sleep") as sleep:
+            return sm.measure_cpu(previous), sleep
+
+    def test_interval_average_without_sleeping(self):
+        previous = {"busy": 100, "total": 1000, "time": 0}
+        (percent, sample), sleep = self.measure(previous, (160, 1200))
+        self.assertEqual(percent, 30.0)  # 60 busy of 200
+        self.assertEqual((sample["busy"], sample["total"]), (160, 1200))
+        self.assertIn("time", sample)
+        sleep.assert_not_called()
+
+    def test_two_runs_chain_through_the_saved_sample(self):
+        with mock.patch.object(sm, "read_cpu_counters", side_effect=[(10, 100), (10, 100)]), \
+                mock.patch.object(sm.time, "sleep"):
+            _, first = sm.measure_cpu(None)
+        (percent, _), _ = self.measure(first, (40, 200))
+        self.assertEqual(percent, 30.0)
+
+    def test_first_run_falls_back_to_one_second_sample(self):
+        (percent, sample), sleep = self.measure(None, (10, 100), (60, 200))
+        self.assertEqual(percent, 50.0)
+        sleep.assert_called_once_with(1)
+        self.assertEqual((sample["busy"], sample["total"]), (60, 200))
+
+    def test_reboot_negative_delta_falls_back(self):
+        previous = {"busy": 5000, "total": 9000, "time": 0}
+        (percent, sample), sleep = self.measure(previous, (10, 100), (20, 200))
+        self.assertEqual(percent, 10.0)
+        sleep.assert_called_once()
+        self.assertEqual(sample["total"], 200)
+
+    def test_zero_total_delta_falls_back(self):
+        previous = {"busy": 10, "total": 100, "time": 0}
+        (percent, _), sleep = self.measure(previous, (10, 100), (30, 200))
+        self.assertEqual(percent, 20.0)
+        sleep.assert_called_once()
+
+    def test_garbage_sample_falls_back(self):
+        (percent, _), sleep = self.measure({"busy": "x"}, (0, 0), (50, 100))
+        self.assertEqual(percent, 50.0)
+        sleep.assert_called_once()
+
+    def test_no_counters_means_no_cpu(self):
+        (percent, sample), sleep = self.measure(None, None)
+        self.assertEqual((percent, sample), (None, None))
+        sleep.assert_not_called()
+
+
+class RunOnceStateTests(unittest.TestCase):
+    def setUp(self):
+        self.cfg = make_cfg(webhook=True)
+        self.state_path = sm.file_in(self.cfg, sm.STATE_FILE)
+
+    def run_once(self, webhook_ok, percent=95.0, sample=None):
+        sample = sample or {"busy": 1.0, "total": 2.0, "time": 5.0}
+        with mock.patch.object(sm, "measure_cpu", return_value=(percent, sample)), \
+                mock.patch.object(sm, "get_memory_usage", return_value=None), \
+                mock.patch.object(sm, "get_disk_usage", return_value=None), \
+                mock.patch.object(sm, "get_load_average", return_value=None), \
+                mock.patch.object(sm, "collect_top_processes", return_value={}), \
+                mock.patch.object(sm, "send_webhook",
+                                  return_value=(webhook_ok, "x")), \
+                contextlib.redirect_stdout(io.StringIO()):
+            sm.run_once(self.cfg)
+        return json.loads(self.state_path.read_text())
+
+    def test_console_summary_lists_top_processes(self):
+        top = {"cpu": [{"name": "php-fpm", "percent": 62.5}]}
+        out = io.StringIO()
+        with mock.patch.object(sm, "collect_top_processes", return_value=top), \
+                mock.patch.object(sm, "measure_cpu", return_value=(95.0, None)), \
+                mock.patch.object(sm, "send_webhook", return_value=(True, "x")), \
+                contextlib.redirect_stdout(out):
+            sm.run_once(self.cfg)
+        self.assertIn("ALERT: CPU at 95% (CRITICAL)", out.getvalue())
+        self.assertIn("  Top processes by CPU:\n    1. php-fpm  62.5%", out.getvalue())
+
+    def test_failed_delivery_saves_cpu_sample_but_not_levels(self):
+        state = self.run_once(webhook_ok=False)
+        self.assertEqual(state["cpu_sample"]["total"], 2.0)
+        self.assertEqual(state["levels"], {})
+
+    def test_successful_delivery_advances_levels(self):
+        state = self.run_once(webhook_ok=True)
+        self.assertEqual(state["levels"], {"cpu": 90})
+        self.assertEqual(state["cpu_sample"]["total"], 2.0)
+
+    def test_failed_delivery_keeps_previous_levels(self):
+        self.state_path.write_text(json.dumps({"levels": {"cpu": 70}}))
+        self.assertEqual(self.run_once(webhook_ok=False)["levels"], {"cpu": 70})
+
+    def test_old_flat_state_still_loads_and_is_migrated(self):
+        self.state_path.write_text(json.dumps({"cpu": 90, "memory": 70}))
+        state = sm.load_state(self.cfg)
+        self.assertEqual(state["levels"], {"cpu": 90, "memory": 70})
+        self.assertIsNone(state["cpu_sample"])
+        saved = self.run_once(webhook_ok=True)  # cpu stays at 90: no alert
+        self.assertEqual(saved["levels"], {"cpu": 90, "memory": 70})
+        self.assertIn("cpu_sample", saved)
+
+    def test_missing_or_corrupt_state(self):
+        self.assertEqual(sm.load_state(self.cfg)["levels"], {})
+        self.state_path.write_text("{not json")
+        self.assertEqual(sm.load_state(self.cfg)["levels"], {})
+
+
+class SustainTests(unittest.TestCase):
+    def check(self, cfg, value, levels, pending):
+        alerts, levels = sm.build_alerts(cfg, cpu(value), levels, pending)
+        return alerts, levels
+
+    def cfg_with(self, n):
+        cfg = make_cfg()
+        cfg["sustain_checks"] = n
+        return cfg
+
+    def test_default_alerts_immediately(self):
+        self.assertEqual(make_cfg()["sustain_checks"], 1)
+        alerts, _ = self.check(make_cfg(), 75.0, {}, {})
+        self.assertEqual(len(alerts), 1)
+
+    def test_three_alerts_on_third_consecutive_check(self):
+        cfg, levels, pending = self.cfg_with(3), {}, {}
+        for expected in (0, 0, 1):
+            alerts, levels = self.check(cfg, 75.0, levels, pending)
+            self.assertEqual(len(alerts), expected)
+        self.assertEqual(levels["cpu"], 70)
+
+    def test_drop_in_between_resets_the_counter(self):
+        cfg, levels, pending = self.cfg_with(3), {}, {}
+        for value in (75.0, 75.0, 10.0, 75.0, 75.0):
+            alerts, levels = self.check(cfg, value, levels, pending)
+            self.assertEqual(alerts, [])
+        alerts, _ = self.check(cfg, 75.0, levels, pending)
+        self.assertEqual(len(alerts), 1)
+
+    def test_higher_level_keeps_the_streak(self):
+        cfg, levels, pending = self.cfg_with(2), {}, {}
+        self.check(cfg, 72.0, levels, pending)
+        alerts, levels = self.check(cfg, 85.0, levels, pending)
+        self.assertEqual(alerts[0]["threshold"], 80)
+
+    def test_lower_level_restarts_the_streak(self):
+        cfg, levels, pending = self.cfg_with(2), {}, {}
+        self.check(cfg, 85.0, levels, pending)
+        alerts, _ = self.check(cfg, 72.0, levels, pending)
+        self.assertEqual(alerts, [])
+        self.assertEqual(pending["cpu"], {"level": 70, "count": 1})
+
+    def test_recovery_is_never_delayed(self):
+        cfg = self.cfg_with(5)
+        alerts, levels = self.check(cfg, 10.0, {"cpu": 80}, {})
+        self.assertEqual(alerts[0]["threshold"], 0)
+        self.assertEqual(levels["cpu"], 0)
+
+    def test_hysteresis_drop_is_never_delayed(self):
+        alerts, _ = self.check(self.cfg_with(5), 74.0, {"cpu": 80}, {})
+        self.assertEqual(alerts[0]["threshold"], 70)
+
+    def test_failed_delivery_retries_without_waiting_again(self):
+        cfg, pending = self.cfg_with(2), {}
+        self.check(cfg, 75.0, {}, pending)
+        alerts, _ = self.check(cfg, 75.0, {}, pending)  # fires, but levels not saved
+        self.assertEqual(len(alerts), 1)
+        alerts, levels = self.check(cfg, 75.0, {}, pending)  # retried at once
+        self.assertEqual(len(alerts), 1)
+        self.check(cfg, 75.0, levels, pending)  # delivered: no more alerts, counter gone
+        self.assertNotIn("cpu", pending)
+
+    def test_bad_value_means_one(self):
+        cfg = self.cfg_with("abc")
+        alerts, _ = self.check(cfg, 75.0, {}, {})
+        self.assertEqual(len(alerts), 1)
+
+
+class TitleTests(MessageTests):
+    def data(self, alerts, **extra):
+        data = {"server": "Cloudways", "hostname": "h", "platform": "p",
+                "timestamp": "2026-11-20T18:05:03+00:00",
+                "metrics": {"cpu": {"percent": 75.0}, "memory": {"percent": 85.0},
+                            "disk": {"percent": 54.0}}, "alerts": alerts}
+        data.update(extra)
+        return data
+
+    def test_title_names_most_severe_with_counter(self):
+        title, body = sm.build_message(self.data(two_alerts()))
+        self.assertEqual(title, "[SOSMonitor] Cloudways: Memory at 85% (WARNING) (+1 more)")
+        self.assertEqual(body, "\n".join([
+            "Server: Cloudways",
+            "Time: 2026-11-20T18:05:03+00:00",
+            "",
+            "Alerts:",
+            "  - CPU at 75%",
+            "  - Memory at 85% (WARNING)",
+            "",
+            "Current metrics:",
+            "  CPU 75% | MEMORY 85% | DISK 54%",
+        ]) + "\n")
+
+    def test_tie_on_level_is_broken_by_value(self):
+        alerts = two_alerts()
+        alerts[0].update(threshold=80, value=88.0, message="CPU at 88% (WARNING)")
+        title, _ = sm.build_message(self.data(alerts))
+        self.assertIn("CPU at 88%", title)
+
+    def test_single_alert_has_no_counter(self):
+        title, _ = sm.build_message(self.data(two_alerts()[:1]))
+        self.assertEqual(title, "[SOSMonitor] Cloudways: CPU at 75%")
+
+    def test_message_fields_equal_email_and_are_empty_without_alerts(self):
+        cfg = make_cfg(email=True)
+        data = sm.build_payload(cfg, cpu(75.0), two_alerts())
+        message = self.sent_email(data)
+        self.assertEqual(data["message_title"], message["Subject"])
+        self.assertEqual(data["message_body"], message.get_content())
+        self.assertTrue(data["message_title"].endswith("(+1 more)"))
+        empty = sm.build_payload(cfg, cpu(10.0), [])
+        self.assertEqual((empty["message_title"], empty["message_body"]), ("", ""))
+
+
+class TopProcessTests(unittest.TestCase):
+    PS = ("  PID COMMAND            %MEM   RSS\n"
+          "    1 mysqld              6.1 1048576\n"
+          "    2 php-fpm: pool www   8.2 1363148\n"
+          "    3 node                2.4 404480\n"
+          "    4 weird/bin/secret-tool --password=hunter2 1.0 100\n")
+
+    def ps(self, **kwargs):
+        defaults = dict(returncode=0, stdout=self.PS, stderr="")
+        defaults.update(kwargs)
+        return mock.patch.object(sm.subprocess, "run",
+                                 return_value=mock.Mock(**defaults))
+
+    def memory(self, count=3):
+        with mock.patch.object(sm, "psutil", None), \
+                mock.patch.object(sm, "get_memory_usage",
+                                  return_value={"total_bytes": 16 * 1024 ** 3}), \
+                self.ps():
+            return sm.top_memory(count)
+
+    def test_memory_ranked_by_rss_with_name_only(self):
+        rows = self.memory()
+        self.assertEqual(rows[0]["name"], "php-fpm:")  # largest rss first
+        self.assertEqual(rows[0]["rss_bytes"], 1363148 * 1024)
+        self.assertEqual(len(rows), 3)
+
+    def test_names_never_carry_arguments(self):
+        rows = self.memory(count=10)
+        names = " ".join(r["name"] for r in rows)
+        self.assertNotIn("hunter2", names)
+        self.assertNotIn("--password", names)
+        self.assertTrue(all(len(r["name"]) <= sm.TOP_NAME_WIDTH for r in rows))
+
+    def test_cpu_from_proc_deltas_not_ps(self):
+        first = {1: ("busy", 100), 2: ("idle", 5), 3: ("gone-later", 9)}
+        second = {1: ("busy", 150), 2: ("idle", 5), 4: ("new", 80)}
+        with mock.patch.object(sm, "psutil", None), \
+                mock.patch.object(sm, "_proc_cpu_ticks", side_effect=[first, second]), \
+                mock.patch.object(sm.time, "sleep"), \
+                mock.patch.object(sm.time, "monotonic", side_effect=[0, 0, 1, 1, 1, 1]), \
+                mock.patch.object(sm.os, "sysconf", create=True, return_value=100), \
+                mock.patch.object(sm.subprocess, "run") as run:
+            rows = sm.top_cpu(3)
+        self.assertEqual(rows, [{"name": "busy", "percent": 50.0}])
+        run.assert_not_called()
+
+    def alerts_for(self, *metrics):
+        return [{"metric": m, "value": 90.0, "threshold": 90, "previous_threshold": 0,
+                 "message": m} for m in metrics]
+
+    def test_collected_only_for_alerting_metrics(self):
+        cfg = make_cfg()
+        with mock.patch.object(sm, "top_memory", return_value=[{"name": "a"}]) as mem, \
+                mock.patch.object(sm, "top_cpu", return_value=[{"name": "b"}]) as cpu_:
+            self.assertEqual(sm.collect_top_processes(cfg, []), {})
+            self.assertEqual(sm.collect_top_processes(cfg, self.alerts_for("disk")), {})
+            self.assertEqual(sm.collect_top_processes(cfg, self.alerts_for("memory")),
+                             {"memory": [{"name": "a"}]})
+            mem.assert_called_once_with(3)
+            cpu_.assert_not_called()
+
+    def test_no_collection_on_recovery_or_when_disabled(self):
+        cfg = make_cfg()
+        recovery = self.alerts_for("cpu")
+        recovery[0]["threshold"] = 0
+        with mock.patch.object(sm, "top_cpu") as top:
+            self.assertEqual(sm.collect_top_processes(cfg, recovery), {})
+            cfg["top_processes"]["enabled"] = False
+            self.assertEqual(sm.collect_top_processes(cfg, self.alerts_for("cpu")), {})
+        top.assert_not_called()
+
+    def test_failures_yield_no_list(self):
+        cfg = make_cfg()
+        for error in (FileNotFoundError("ps"), PermissionError("hidepid"),
+                      sm.subprocess.TimeoutExpired("ps", 3)):
+            with mock.patch.object(sm, "top_memory", side_effect=error):
+                self.assertEqual(sm.collect_top_processes(cfg, self.alerts_for("memory")), {})
+
+    def test_ps_missing_or_failing_gives_empty(self):
+        with mock.patch.object(sm, "psutil", None), \
+                mock.patch.object(sm.subprocess, "run", side_effect=FileNotFoundError):
+            with self.assertRaises(FileNotFoundError):
+                sm.top_memory(3)  # swallowed one level up, by collect_top_processes
+        with mock.patch.object(sm, "psutil", None), self.ps(returncode=1, stdout=""):
+            self.assertEqual(sm.top_memory(3), [])
+
+    def test_alert_is_still_sent_when_lookup_fails(self):
+        cfg = make_cfg(webhook=True)
+        with mock.patch.object(sm, "top_memory", side_effect=OSError("denied")), \
+                mock.patch.object(sm, "send_webhook", return_value=(True, "HTTP 200")) as hook:
+            top = sm.collect_top_processes(cfg, self.alerts_for("memory"))
+            data = sm.build_payload(cfg, cpu(95.0), ALERT, top)
+            sm.deliver(cfg, data)
+        self.assertNotIn("top_processes", hook.call_args[0][1])
+        self.assertNotIn("Top processes", hook.call_args[0][1]["message_body"])
+
+    def test_rendering_and_payload(self):
+        top = {"memory": [{"name": "php-fpm", "percent": 8.2, "rss_bytes": 1395864371},
+                          {"name": "mysqld", "percent": 6.1, "rss_bytes": 1073741824},
+                          {"name": "node", "percent": 2.4, "rss_bytes": 414187520}]}
+        data = sm.build_payload(make_cfg(), cpu(95.0), ALERT, top)
+        self.assertEqual(data["top_processes"], top)
+        self.assertIn("\nTop processes by memory:\n"
+                      "  1. php-fpm  8.2% (1.3 GB)\n"
+                      "  2. mysqld   6.1% (1.0 GB)\n"
+                      "  3. node     2.4% (395 MB)\n", data["message_body"])
+        self.assertLess(data["message_body"].index("Top processes"),
+                        data["message_body"].index("Current metrics"))
+
+    def test_cpu_rendering(self):
+        top = {"cpu": [{"name": "php", "percent": 45.0}]}
+        data = sm.build_payload(make_cfg(), cpu(95.0), ALERT, top)
+        self.assertIn("Top processes by CPU:\n  1. php  45.0%\n", data["message_body"])
+
+
+class NewConfigKeysTests(unittest.TestCase):
+    def test_old_config_without_new_keys_uses_defaults(self):
+        tmp = Path(tempfile.mkdtemp())
+        path = tmp / "config.json"
+        path.write_text(json.dumps({"server_name": "OLD"}))
+        before = path.read_bytes()
+        cfg = sm.load_config(path)
+        self.assertEqual(cfg["sustain_checks"], 1)
+        self.assertEqual(cfg["top_processes"], {"enabled": True, "count": 3})
+        self.assertEqual(path.read_bytes(), before)
+
+    def test_partial_top_processes_is_merged(self):
+        tmp = Path(tempfile.mkdtemp())
+        path = tmp / "config.json"
+        path.write_text(json.dumps({"top_processes": {"count": 5}}))
+        self.assertEqual(sm.load_config(path)["top_processes"], {"enabled": True, "count": 5})
 
 
 class LockTests(unittest.TestCase):
