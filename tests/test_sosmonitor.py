@@ -182,7 +182,7 @@ class DeliveryTests(unittest.TestCase):
 
 class EmailFormatTests(unittest.TestCase):
     def test_subject_and_body(self):
-        subject, body = sm.format_email(payload(ALERT))
+        subject, body = sm.build_message(payload(ALERT))
         self.assertEqual(subject, "[SOSMonitor] S: CPU at 95% (CRITICAL)")
         self.assertIn("CPU      95%", body)
 
@@ -228,6 +228,40 @@ class ConfigTests(unittest.TestCase):
         self.assertTrue(default.exists())
         self.assertIn(str(default), out)
 
+    def test_old_config_missing_new_key_uses_default(self):
+        old = sm.build_template("OLD")
+        del old["recovery_message"]
+        del old["email"]["smtp_port"]
+        self.path.write_text(json.dumps(old))
+        before = self.path.read_bytes()
+        # A key that a newer version adds to DEFAULTS.
+        with mock.patch.dict(sm.DEFAULTS, {"new_option": 42}):
+            cfg = sm.load_config(self.path)
+        self.assertEqual(cfg["new_option"], 42)
+        self.assertEqual(cfg["recovery_message"], sm.DEFAULTS["recovery_message"])
+        self.assertEqual(cfg["email"]["smtp_port"], 587)
+        self.assertEqual(cfg["server_name"], "OLD")
+        self.assertEqual(self.path.read_bytes(), before)
+
+    def test_install_twice_leaves_config_byte_for_byte(self):
+        # Hand-edited formatting and a missing key must survive untouched.
+        self.path.write_text('{ "server_name": "HAND",\n\t"disk_path": "/data" }')
+        before = self.path.read_bytes()
+        with mock.patch.object(sm, "crontab_read", return_value=""), \
+                mock.patch.object(sm, "crontab_write"), \
+                mock.patch.object(sm, "install_shortcut"):
+            for _ in range(2):
+                code, _ = cli("-c", str(self.path), "install")
+                self.assertEqual(code, 0)
+                self.assertEqual(self.path.read_bytes(), before)
+
+    def test_version_flag(self):
+        with self.assertRaises(SystemExit) as exit_, \
+                contextlib.redirect_stdout(io.StringIO()) as out:
+            sm.main(["--version"])
+        self.assertEqual(exit_.exception.code, 0)
+        self.assertEqual(out.getvalue().strip(), f"SOSMonitor {sm.VERSION}")
+
     def test_bad_threshold_key(self):
         self.path.write_text(json.dumps({"thresholds": {"abc": "x"}}))
         with self.assertRaises(SystemExit) as error:
@@ -247,7 +281,7 @@ class CronTests(unittest.TestCase):
                 mock.patch.object(sm, "crontab_write") as write, \
                 mock.patch.object(sm.os, "name", os_name), \
                 contextlib.redirect_stdout(out):
-            code = sm.cmd_install(self.cfg, self.path)
+            code = sm.cmd_install(self.cfg, self.path, shortcut=False)
         return code, write, out.getvalue()
 
     def test_install_writes_tagged_line_with_config_path(self):
@@ -279,9 +313,180 @@ class CronTests(unittest.TestCase):
         current = f"0 * * * * backup\n* * * * * x {sm.CRON_MARK}\n"
         with mock.patch.object(sm, "crontab_read", return_value=current), \
                 mock.patch.object(sm, "crontab_write") as write, \
+                mock.patch.object(sm, "remove_shortcut"), \
                 contextlib.redirect_stdout(io.StringIO()):
             sm.cmd_uninstall()
         write.assert_called_once_with(["0 * * * * backup"])
+
+
+class MessageTests(unittest.TestCase):
+    def sent_email(self, data):
+        email = make_cfg(email=True)["email"]
+        email.update(smtp_host="smtp.test", to=["a@b.test"], **{"from": "m@b.test"})
+        with mock.patch.object(sm.smtplib, "SMTP") as smtp:
+            ok, _ = sm.send_email(email, data)
+        self.assertTrue(ok)
+        return smtp.return_value.send_message.call_args[0][0]
+
+    def test_webhook_fields_match_email(self):
+        data = sm.build_payload(make_cfg(), cpu(95.0), ALERT)
+        message = self.sent_email(data)
+        self.assertEqual(data["message_title"], message["Subject"])
+        self.assertEqual(data["message_body"], message.get_content())
+        self.assertIn("CPU at 95% (CRITICAL)", data["message_title"])
+
+    def test_fields_empty_without_alerts(self):
+        data = sm.build_payload(make_cfg(), cpu(10.0), [])
+        self.assertEqual(data["message_title"], "")
+        self.assertEqual(data["message_body"], "")
+
+
+class RunTestCommandTests(unittest.TestCase):
+    def run_test(self, cfg):
+        out = io.StringIO()
+        with mock.patch.object(sm, "collect_metrics", return_value=cpu(12.0)), \
+                mock.patch.object(sm, "send_webhook", return_value=(True, "HTTP 200")) as hook, \
+                contextlib.redirect_stdout(out):
+            code = sm.run_test(cfg)
+        return code, out.getvalue(), hook
+
+    def test_prints_message_without_channels(self):
+        code, out, hook = self.run_test(make_cfg())
+        self.assertEqual(code, 2)
+        self.assertIn("[SOSMonitor] S: SOSMonitor test", out)
+        self.assertIn("- SOSMonitor test", out)
+        self.assertIn("CPU      12%", out)
+        self.assertIn("No channel enabled", out)
+        hook.assert_not_called()
+
+    def test_prints_message_before_results(self):
+        code, out, hook = self.run_test(make_cfg(webhook=True))
+        self.assertEqual(code, 0)
+        self.assertLess(out.index("[SOSMonitor] S: SOSMonitor test"), out.index("webhook: HTTP 200"))
+        sent = hook.call_args[0][1]
+        self.assertTrue(sent["test"])
+        self.assertEqual(sent["message_title"], "[SOSMonitor] S: SOSMonitor test")
+
+
+class ShortcutTests(unittest.TestCase):
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        self.home = Path(self.tmp.name) / "home"
+        self.home.mkdir()
+        self.script = Path(self.tmp.name) / "app" / "sosmonitor.py"
+        self.script.parent.mkdir()
+        self.script.write_text("#!/usr/bin/env python3\n")
+        self.link = self.home / ".local" / "bin" / "sosmonitor"
+        patches = [
+            mock.patch.dict(sm.os.environ, {"HOME": str(self.home), "PATH": "/usr/bin:/bin"}),
+            mock.patch.object(sm, "SCRIPT", self.script),
+            mock.patch.object(sm, "shell_finds_command", return_value=True),
+        ]
+        for patch in patches:
+            patch.start()
+            self.addCleanup(patch.stop)
+        self.addCleanup(self.tmp.cleanup)
+
+    def run_quiet(self, func):
+        out = io.StringIO()
+        with contextlib.redirect_stdout(out):
+            func()
+        return out.getvalue()
+
+    def install(self):
+        return self.run_quiet(sm.install_shortcut)
+
+    def block_count(self, name):
+        return (self.home / name).read_text().splitlines().count(sm.CRON_MARK)
+
+    def test_writes_every_existing_startup_file(self):
+        (self.home / ".bashrc").write_text("alias ll='ls -l'\n")
+        (self.home / ".profile").write_text("umask 022")  # no trailing newline
+        out = self.install()
+        self.assertEqual(self.link.resolve(), self.script.resolve())
+        self.assertTrue(self.script.stat().st_mode & 0o100)
+        for name in (".bashrc", ".profile"):
+            text = (self.home / name).read_text()
+            self.assertTrue(text.endswith(f"{sm.CRON_MARK}\n{sm.PATH_LINE}\n"))
+        self.assertEqual((self.home / ".profile").read_text().splitlines()[0], "umask 022")
+        self.assertFalse((self.home / ".zshrc").exists())
+        self.assertFalse((self.home / ".bash_profile").exists())
+        self.assertIn(sm.PATH_LINE, out)
+
+    def test_creates_bashrc_when_none_exists(self):
+        self.install()
+        self.assertEqual((self.home / ".bashrc").read_text(), f"{sm.CRON_MARK}\n{sm.PATH_LINE}\n")
+
+    def test_second_run_is_idempotent(self):
+        (self.home / ".bashrc").write_text("x=1\n")
+        (self.home / ".zshrc").write_text("y=2\n")
+        self.install()
+        self.install()
+        self.assertEqual(self.block_count(".bashrc"), 1)
+        self.assertEqual(self.block_count(".zshrc"), 1)
+        self.assertTrue(self.link.is_symlink())
+
+    def test_uninstall_removes_only_block_and_link(self):
+        original = {".bashrc": "a=1\n# my notes\n", ".bash_profile": "b=2", ".zshrc": ""}
+        for name, text in original.items():
+            (self.home / name).write_text(text)
+        self.install()
+        with mock.patch.object(sm, "uninstall_cron"):
+            self.run_quiet(sm.cmd_uninstall)
+        self.assertFalse(self.link.exists() or self.link.is_symlink())
+        expected = dict(original, **{".bash_profile": "b=2\n"})  # newline added before the block
+        for name, text in expected.items():
+            self.assertEqual((self.home / name).read_text(), text)
+
+    def test_uninstall_keeps_foreign_link(self):
+        other = Path(self.tmp.name) / "other"
+        other.write_text("")
+        self.link.parent.mkdir(parents=True)
+        self.link.symlink_to(other)
+        self.run_quiet(sm.remove_shortcut)
+        self.assertTrue(self.link.is_symlink())
+
+    def test_regular_file_is_not_overwritten(self):
+        self.link.parent.mkdir(parents=True)
+        self.link.write_text("mine")
+        out = self.install()
+        self.assertIn("WARNING", out)
+        self.assertEqual(self.link.read_text(), "mine")
+        self.assertFalse((self.home / ".bashrc").exists())
+
+    def test_already_on_path_touches_no_startup_file(self):
+        sm.os.environ["PATH"] = f"{self.home}/.local/bin:/usr/bin"
+        (self.home / ".bashrc").write_text("a=1\n")
+        self.install()
+        self.assertTrue(self.link.is_symlink())
+        self.assertEqual((self.home / ".bashrc").read_text(), "a=1\n")
+
+    def test_failed_verification_prints_full_path(self):
+        with mock.patch.object(sm, "shell_finds_command", return_value=False):
+            out = self.install()
+        self.assertIn("WARNING", out)
+        self.assertIn(str(self.link), out)
+        self.assertNotIn("Command installed", out)
+        self.assertIn(sm.PATH_LINE, out)
+
+    def test_install_wiring(self):
+        cfg, path = make_cfg(), Path("/x/config.json")
+        with mock.patch.object(sm, "install_cron", return_value=0), \
+                mock.patch.object(sm, "install_shortcut") as shortcut:
+            sm.cmd_install(cfg, path)
+            shortcut.assert_called_once()
+            shortcut.reset_mock()
+            sm.cmd_install(cfg, path, shortcut=False)
+            with mock.patch.object(sm.os, "name", "nt"):
+                sm.cmd_install(cfg, path)
+            shortcut.assert_not_called()
+
+    def test_no_shortcut_flag(self):
+        config = Path(self.tmp.name) / "config.json"
+        config.write_text("{}")
+        with mock.patch.object(sm, "cmd_install", return_value=0) as install:
+            cli("-c", str(config), "install", "--no-shortcut")
+        self.assertIs(install.call_args.kwargs["shortcut"], False)
 
 
 class LockTests(unittest.TestCase):

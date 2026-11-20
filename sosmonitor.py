@@ -7,9 +7,11 @@ and/or email when a threshold is crossed. Standard library only; psutil is
 used when installed.
 
     python3 sosmonitor.py              one check (creates config.json if missing)
-    python3 sosmonitor.py test         send a test alert to the enabled channels
-    python3 sosmonitor.py install      schedule in crontab
-    python3 sosmonitor.py uninstall    remove from crontab
+    python3 sosmonitor.py test         print a test alert and send it to the enabled channels
+    python3 sosmonitor.py install      schedule in crontab and create the `sosmonitor` command
+                                       (--no-shortcut: only the crontab)
+    python3 sosmonitor.py uninstall    remove from crontab and remove the command
+    python3 sosmonitor.py --version    print the version
 """
 
 from __future__ import annotations
@@ -38,6 +40,7 @@ try:
 except ImportError:
     psutil = None
 
+VERSION = "0.1.0"
 SCRIPT = Path(__file__).resolve()
 CRON_MARK = "# sosmonitor"
 LOG_FILE = "sosmonitor.log"
@@ -105,6 +108,8 @@ def create_config(path: Path) -> None:
 
 
 def load_config(path: Path) -> dict:
+    """Read-only: keys missing from the file fall back to DEFAULTS, and the
+    file is never rewritten, so an old config keeps working after an update."""
     try:
         raw = json.loads(path.read_text(encoding="utf-8"))
     except json.JSONDecodeError as error:
@@ -341,8 +346,12 @@ def send_webhook(webhook: dict, payload: dict) -> Tuple[bool, str]:
         return False, f"connection error: {error}"
 
 
-def format_email(payload: dict) -> Tuple[str, str]:
+def build_message(payload: dict) -> Tuple[str, str]:
+    """Human-readable (title, body) of the alerts; ("", "") when there are none.
+    Single source for the email, the webhook message fields and `test` output."""
     messages = [alert["message"] for alert in payload["alerts"]]
+    if not messages:
+        return "", ""
     subject = f"[SOSMonitor] {payload['server']}: " + "; ".join(messages)
 
     lines = [f"Server: {payload['server']} ({payload['hostname']})",
@@ -361,7 +370,7 @@ def send_email(email: dict, payload: dict) -> Tuple[bool, str]:
     if not email["smtp_host"] or not recipients or not sender:
         return False, "smtp not configured (smtp_host, from/username and to)"
 
-    subject, body = format_email(payload)
+    subject, body = build_message(payload)
     message = EmailMessage()
     message["Subject"] = subject
     message["From"] = sender
@@ -433,7 +442,7 @@ def metric_lines(metrics: dict) -> List[str]:
 
 
 def build_payload(cfg: dict, metrics: dict, alerts: list) -> dict:
-    return {
+    payload = {
         "server": cfg["server_name"],
         "hostname": socket.gethostname(),
         "platform": platform.platform(),
@@ -441,6 +450,8 @@ def build_payload(cfg: dict, metrics: dict, alerts: list) -> dict:
         "metrics": metrics,
         "alerts": alerts,
     }
+    payload["message_title"], payload["message_body"] = build_message(payload)
+    return payload
 
 
 def write_log(cfg: dict, record: dict) -> None:
@@ -484,10 +495,6 @@ def run_once(cfg: dict) -> None:
 
 
 def run_test(cfg: dict) -> int:
-    if not (cfg["webhook"]["enabled"] or cfg["email"]["enabled"]):
-        print('No channel enabled. Set "enabled": true in webhook or email in config.json.')
-        return 2
-
     alert = {
         "metric": "test",
         "value": 0,
@@ -497,6 +504,14 @@ def run_test(cfg: dict) -> int:
     }
     payload = build_payload(cfg, collect_metrics(cfg), [alert])
     payload["test"] = True
+
+    print(payload["message_title"])
+    print()
+    print(payload["message_body"], end="")
+
+    if not (cfg["webhook"]["enabled"] or cfg["email"]["enabled"]):
+        print('No channel enabled. Set "enabled": true in webhook or email in config.json.')
+        return 2
 
     _, results = deliver(cfg, payload, force=True)
     failed = False
@@ -539,7 +554,7 @@ def crontab_write(lines: List[str]) -> None:
     subprocess.run(["crontab", "-"], input=text, text=True, check=True)
 
 
-def cmd_install(cfg: dict, config_path: Path) -> int:
+def install_cron(cfg: dict, config_path: Path) -> int:
     minutes = min(59, max(1, int(cfg["check_interval_minutes"])))
     command = f'"{sys.executable}" "{SCRIPT}" -c "{config_path}" run'
 
@@ -560,21 +575,153 @@ def cmd_install(cfg: dict, config_path: Path) -> int:
     return 0
 
 
-def cmd_uninstall() -> int:
+def cmd_install(cfg: dict, config_path: Path, shortcut: bool = True) -> int:
+    code = install_cron(cfg, config_path)
+    if shortcut and os.name != "nt":
+        install_shortcut()
+    return code
+
+
+def uninstall_cron() -> None:
     current = crontab_read()
     if current is None and os.name == "nt":
         print(f"No crontab on Windows. Remove the task with:\n  schtasks /Delete /TN {TASK_NAME} /F")
-        return 0
+        return
     lines = (current or "").splitlines()
     kept = [line for line in lines if CRON_MARK not in line]
 
     if len(kept) == len(lines):
         print("No cron entry found")
-        return 0
+        return
 
     crontab_write(kept)
     print("Cron entry removed")
+
+
+def cmd_uninstall() -> int:
+    uninstall_cron()
+    if os.name != "nt":
+        remove_shortcut()
     return 0
+
+
+# ============================================================
+# SHORTCUT (the `sosmonitor` command, Linux/macOS)
+# ============================================================
+
+STARTUP_FILES = (".bashrc", ".bash_profile", ".profile", ".zshrc")
+PATH_LINE = 'export PATH="$HOME/.local/bin:$PATH"'
+
+
+def bin_dir() -> Path:
+    return Path.home() / ".local" / "bin"
+
+
+def add_path_block(home: Path) -> List[Path]:
+    """Appends the PATH block to every existing startup file (or a new .bashrc)."""
+    files = [home / name for name in STARTUP_FILES if (home / name).is_file()]
+    files = files or [home / ".bashrc"]
+    changed = []
+    for path in files:
+        text = path.read_text(encoding="utf-8") if path.exists() else ""
+        if any(line.strip() == CRON_MARK for line in text.splitlines()):
+            continue
+        if text and not text.endswith("\n"):
+            text += "\n"
+        path.write_text(f"{text}{CRON_MARK}\n{PATH_LINE}\n", encoding="utf-8")
+        changed.append(path)
+    return changed
+
+
+def remove_path_block(home: Path) -> List[Path]:
+    """Removes the marker line and the PATH line right after it."""
+    changed = []
+    for name in STARTUP_FILES:
+        path = home / name
+        if not path.is_file():
+            continue
+        lines = path.read_text(encoding="utf-8").splitlines(keepends=True)
+        kept, i = [], 0
+        while i < len(lines):
+            if lines[i].strip() == CRON_MARK:
+                i += 2 if i + 1 < len(lines) and lines[i + 1].strip() == PATH_LINE else 1
+                continue
+            kept.append(lines[i])
+            i += 1
+        if len(kept) != len(lines):
+            path.write_text("".join(kept), encoding="utf-8")
+            changed.append(path)
+    return changed
+
+
+def shell_finds_command() -> bool:
+    """Best effort: does a fresh login or interactive bash find `sosmonitor`?"""
+    if not shutil.which("bash"):
+        return False
+    for flag in ("-lc", "-ic"):
+        try:
+            result = subprocess.run(["bash", flag, "command -v sosmonitor"],
+                                    stdin=subprocess.DEVNULL, capture_output=True,
+                                    text=True, timeout=5)
+        except (subprocess.TimeoutExpired, OSError):
+            continue
+        if result.returncode == 0 and result.stdout.strip():
+            return True
+    return False
+
+
+def install_shortcut() -> None:
+    folder = bin_dir()
+    link = folder / "sosmonitor"
+    try:
+        SCRIPT.chmod(SCRIPT.stat().st_mode | 0o111)
+        folder.mkdir(parents=True, exist_ok=True)
+        if link.is_symlink():
+            link.unlink()
+        elif link.exists():
+            print(f"WARNING: {link} already exists and is not a link; left it untouched. "
+                  f"Run the script with its full path: {SCRIPT}")
+            return
+        link.symlink_to(SCRIPT)
+    except OSError as error:
+        print(f"WARNING: could not create the sosmonitor command: {error}")
+        return
+
+    on_path = {os.path.normpath(os.path.expanduser(entry))
+               for entry in os.environ.get("PATH", "").split(os.pathsep) if entry}
+    if os.path.normpath(str(folder)) in on_path:
+        print("Command installed: sosmonitor")
+        return
+
+    try:
+        changed = add_path_block(Path.home())
+    except OSError as error:
+        print(f"WARNING: could not update shell startup files: {error}")
+        changed = []
+    if changed:
+        print("Added ~/.local/bin to PATH in: " + ", ".join(p.name for p in changed))
+
+    if shell_finds_command():
+        print(f"Command installed: sosmonitor ({link})")
+    else:
+        print("WARNING: could not confirm that a new shell finds `sosmonitor`; this host's "
+              f"shell may not load startup files. Use the full path instead: {link}")
+    print("Open a new session to use `sosmonitor`, or run this to use it right now:\n"
+          f"  {PATH_LINE}")
+
+
+def remove_shortcut() -> None:
+    link = bin_dir() / "sosmonitor"
+    try:
+        if link.is_symlink() and link.resolve() == SCRIPT.resolve():
+            link.unlink()
+            print(f"Command removed: {link}")
+        changed = remove_path_block(Path.home())
+    except OSError as error:
+        print(f"WARNING: could not remove the sosmonitor command: {error}")
+        return
+    if changed:
+        print("Removed the PATH line from: " + ", ".join(p.name for p in changed))
 
 
 # ============================================================
@@ -588,6 +735,9 @@ def main(argv: Optional[List[str]] = None) -> int:
                         choices=["run", "test", "install", "uninstall"])
     parser.add_argument("-c", "--config", default=str(SCRIPT.parent / "config.json"),
                         help="path to config.json (default: next to the script)")
+    parser.add_argument("--no-shortcut", action="store_true",
+                        help="install: don't create the sosmonitor command or touch PATH")
+    parser.add_argument("--version", action="version", version=f"SOSMonitor {VERSION}")
     args = parser.parse_args(argv)
 
     if args.command == "uninstall":
@@ -605,7 +755,7 @@ def main(argv: Optional[List[str]] = None) -> int:
     if args.command == "test":
         return run_test(cfg)
     if args.command == "install":
-        return cmd_install(cfg, config_path)
+        return cmd_install(cfg, config_path, shortcut=not args.no_shortcut)
 
     lock = acquire_lock(cfg)
     if lock is None:
