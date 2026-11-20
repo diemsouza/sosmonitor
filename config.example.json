@@ -1,0 +1,28 @@
+{
+  "server_name": "MY-SERVER",
+  "check_interval_minutes": 1,
+  "disk_path": "/",
+  "send_every_check": true,
+  "thresholds": {
+    "70": "{metric} at {value}%",
+    "80": "{metric} at {value}% (WARNING)",
+    "90": "{metric} at {value}% (CRITICAL)",
+    "100": "{metric} at {value}% (AT LIMIT)"
+  },
+  "recovery_message": "{metric} at {value}% (BACK TO NORMAL)",
+  "webhook": {
+    "enabled": false,
+    "url": "",
+    "token": "",
+    "token_header": "X-Monitor-Token"
+  },
+  "email": {
+    "enabled": false,
+    "smtp_host": "",
+    "smtp_port": 587,
+    "username": "",
+    "password": "",
+    "from": "",
+    "to": []
+  }
+}

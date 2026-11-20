@@ -1,0 +1,13 @@
+# Claude Code
+.claude/
+CLAUDE.md
+
+# Local runtime files (may hold real credentials)
+config*.json
+!config.example.json
+*.log
+*.lock
+*_state.json
+
+# Python
+__pycache__/
