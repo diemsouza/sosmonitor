@@ -259,6 +259,9 @@ class ConfigTests(unittest.TestCase):
         script = Path(self.tmp.name) / "app" / "sosmonitor.py"
         with mock.patch.dict(sm.os.environ, {"XDG_CONFIG_HOME": str(xdg)}), \
                 mock.patch.object(sm, "SCRIPT", script), \
+                mock.patch.object(sm.shutil, "which", return_value=None), \
+                mock.patch.object(sm, "find_entry_point", return_value=None), \
+                mock.patch.object(sm, "_own_link", return_value=False), \
                 mock.patch.object(sm, "crontab_read", return_value=("ok", "")), \
                 mock.patch.object(sm, "crontab_write", return_value=(True, "")), \
                 mock.patch.object(sm, "install_shortcut", return_value=SHORTCUT_OK):
@@ -268,7 +271,7 @@ class ConfigTests(unittest.TestCase):
         self.assertTrue(default.exists())
         self.assertFalse((script.parent / "config.json").exists())
         self.assertIn(str(default), out)
-        self.assertIn("python3 sosmonitor.py config", out)
+        self.assertIn(f"python3 {script} config", out)
 
     def test_old_config_missing_new_key_uses_default(self):
         old = sm.build_template("OLD")
@@ -1321,6 +1324,7 @@ class EntryPointInstallTests(unittest.TestCase):
 
     def test_existing_command_means_no_link_and_no_startup_changes(self):
         write, out = self.install()
+        self.assertNotIn("ensurepath", out)
         self.assertFalse((self.home / ".local" / "bin" / "sosmonitor").exists())
         self.assertEqual(self.bashrc.read_text(), "alias a=b\n")
         self.assertEqual(sorted(p.name for p in self.home.iterdir()), [".bashrc", ".local"])
@@ -1334,12 +1338,33 @@ class EntryPointInstallTests(unittest.TestCase):
         self.assertIn(f'"{self.entry}" -c "/srv/config.json" run', line)
         self.assertNotIn("sosmonitor.py", line)
 
-    def test_cron_finds_entry_point_off_path(self):
+    def test_entry_point_off_path_is_recognized_and_hints_the_path_fix(self):
+        before = self.bashrc.read_bytes()
         with mock.patch.dict(sm.os.environ, {"PATH": "/usr/bin"}):
             write, out = self.install()
         self.assertIn(f'"{self.entry}" -c', write.call_args[0][0][-1])
-        self.assertNotIn("Command    already", out)  # off PATH: shortcut flow runs
-        self.assertTrue((self.home / ".local" / "bin" / "sosmonitor").is_symlink())
+        self.assertIn("Command    already", out)
+        self.assertFalse((self.home / ".local" / "bin" / "sosmonitor").exists())
+        self.assertEqual(self.bashrc.read_bytes(), before)
+        self.assertIn("pipx ensurepath", out)
+        self.assertIn(str(self.entry), out)
+
+    def test_uninstall_with_entry_point_off_path_removes_no_shortcut(self):
+        with mock.patch.dict(sm.os.environ, {"PATH": "/usr/bin"}), \
+                mock.patch.object(sm, "remove_shortcut") as remove, \
+                mock.patch.object(sm, "crontab_read", return_value=("ok", "")), \
+                contextlib.redirect_stdout(io.StringIO()):
+            sm.cmd_uninstall()
+        remove.assert_not_called()
+
+    def test_hint_uses_short_name_only_when_the_shell_finds_it(self):
+        self.assertEqual(sm._edit_command(None, Path("/c.json")), "sosmonitor config")
+        with mock.patch.dict(sm.os.environ, {"PATH": "/usr/bin"}):
+            self.assertEqual(sm._edit_command(None, Path("/c.json")), f"{self.entry} config")
+            self.entry.unlink()
+            with mock.patch.object(sm.shutil, "which", return_value=None):
+                self.assertEqual(sm._edit_command(None, Path("/c.json")),
+                                 f"python3 {self.script} config")
 
     def test_without_entry_point_behavior_is_unchanged(self):
         self.entry.unlink()

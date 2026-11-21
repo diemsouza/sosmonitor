@@ -2,6 +2,21 @@
 
 Every version lists what was added, changed and fixed, plus a **Config changes** line: keys that were added, renamed or removed in `config.json` ("none" when nothing changed). Keys missing from your `config.json` always use their default value, so a new key never breaks an old config. See [Updating](README.md#updating).
 
+## 0.3.2 - 2026-11-21
+
+### Changed
+
+- The install docs now lead with the package install (`pipx`), with the single-file `curl` as the option for hosts where nothing can be installed.
+- Documented `pipx ensurepath`: without it the `sosmonitor` command is installed but the shell can't find it.
+- Documented that `pip install sosmonitor` is refused by the system Python on Debian, Ubuntu, Fedora and most current server images (PEP 668), and what to use instead.
+
+### Fixed
+
+- `install` now recognizes a package install (pip, pipx, uv) even before its folder is on your `PATH`, so it no longer tries to create its own link on top of the command that install provides. It marks the step `already` and tells you how to make the command reachable.
+- Commands printed under "Next:" are now always runnable as shown: the short `sosmonitor` name only when the shell can already find it, a full path otherwise.
+
+**Config changes:** none.
+
 ## 0.3.1 - 2026-11-21
 
 ### Added

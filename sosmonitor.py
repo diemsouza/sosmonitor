@@ -44,7 +44,7 @@ try:
 except ImportError:
     psutil = None
 
-VERSION = "0.3.1"
+VERSION = "0.3.2"
 SCRIPT = Path(__file__).resolve()
 CRON_MARK = "# sosmonitor"
 LOG_FILE = "sosmonitor.log"
@@ -958,17 +958,27 @@ def _is_entry_point(path: Path) -> bool:
         return False
 
 
-def find_entry_point(on_path_only: bool = False) -> Optional[Path]:
+def _short_name_works() -> bool:
+    """True when `sosmonitor` typed in this shell runs our command: a package
+    entry point or our own link, not some other program with that name."""
+    found = shutil.which("sosmonitor")
+    if not found:
+        return False
+    try:
+        return _is_entry_point(Path(found)) or Path(found).resolve() == SCRIPT.resolve()
+    except OSError:
+        return False
+
+
+def find_entry_point() -> Optional[Path]:
     """The `sosmonitor` executable a package install (pip, pipx, uv) created, as
-    an absolute path. None when not running from a package. A link that
-    points at this script (the curl-install shortcut) doesn't count."""
+    an absolute path, on PATH or not. None when not running from a package. A
+    link that points at this script (the curl-install shortcut) doesn't count."""
     if not installed_as_package():
         return None
     found = shutil.which("sosmonitor")
     if found and _is_entry_point(Path(found)):
         return Path(os.path.abspath(found))
-    if on_path_only:
-        return None
     folders = [Path(sys.executable).parent, Path(site.getuserbase()) /
                ("Scripts" if sys.platform == "win32" else "bin")]
     scripts = sysconfig.get_path("scripts")
@@ -1023,9 +1033,13 @@ def cmd_install(cfg: dict, config_path: Path, shortcut: bool = True,
     steps: List[Step] = [("Config", "created" if created else "already", str(config_path))]
     notes: List[str] = []
     if shortcut and os.name != "nt":
-        entry = find_entry_point(on_path_only=True)
-        if entry:  # a package install already put the command on PATH
+        entry = find_entry_point()
+        if entry:  # a package install already provides the command
             steps.append(("Command", "already", f"sosmonitor ({_tilde(entry)})"))
+            if not _short_name_works():
+                notes.append("`sosmonitor` is installed but your shell can't find it yet. "
+                             "Run `pipx ensurepath` and open a new session, or use the "
+                             f"full path:\n  {_quote(str(entry))}")
         else:
             status, detail, extra = install_shortcut()
             steps.append(("Command", status, detail))
@@ -1073,7 +1087,7 @@ def uninstall_cron() -> Tuple[str, str]:
 def cmd_uninstall() -> int:
     steps: List[Step] = [("Cron entry",) + uninstall_cron()]
     # With a package entry point and no link of ours, there is nothing we created.
-    if os.name != "nt" and not (find_entry_point(on_path_only=True) and not _own_link()):
+    if os.name != "nt" and not (find_entry_point() and not _own_link()):
         steps += remove_shortcut()
     print_summary(steps)
     if any(s == "failed" and "Full Disk Access" not in d for _, s, d in steps):
@@ -1286,9 +1300,15 @@ def cmd_config(path: Path) -> int:
 
 def _edit_command(explicit: Optional[str], path: Path, command: str = "config") -> str:
     """A command as the user can type it (`-c` only when the config is not at
-    its default place)."""
-    base = "sosmonitor" if find_entry_point(on_path_only=True) or _own_link() \
-        else "python3 sosmonitor.py"
+    its default place). Runnable as printed in the current shell."""
+    if _short_name_works():
+        base = "sosmonitor"
+    elif find_entry_point():
+        base = _quote(str(find_entry_point()))
+    elif _own_link():
+        base = _quote(str(bin_dir() / "sosmonitor"))
+    else:
+        base = f"python3 {_quote(str(SCRIPT))}"
     return f"{base} -c {_quote(str(path))} {command}" if explicit else f"{base} {command}"
 
 
