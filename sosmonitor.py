@@ -6,8 +6,9 @@ Measures CPU, memory, disk and load average and sends alerts by webhook
 and/or email when a threshold is crossed. Standard library only; psutil is
 used when installed.
 
-    python3 sosmonitor.py              one check (creates config.json if missing)
+    python3 sosmonitor.py              one check (needs a config: run `install` first)
     python3 sosmonitor.py test         print a test alert and send it to the enabled channels
+    python3 sosmonitor.py config       open the config in your editor (creates it if missing)
     python3 sosmonitor.py install      schedule in crontab and create the `sosmonitor` command
                                        (--no-shortcut: only the crontab)
     python3 sosmonitor.py uninstall    remove from crontab and remove the command
@@ -20,12 +21,15 @@ import argparse
 import json
 import os
 import platform
+import shlex
 import shutil
+import site
 import smtplib
 import socket
 import ssl
 import subprocess
 import sys
+import sysconfig
 import time
 import urllib.error
 import urllib.request
@@ -40,12 +44,13 @@ try:
 except ImportError:
     psutil = None
 
-VERSION = "0.2.0"
+VERSION = "0.3.1"
 SCRIPT = Path(__file__).resolve()
 CRON_MARK = "# sosmonitor"
 LOG_FILE = "sosmonitor.log"
 STATE_FILE = "sosmonitor_state.json"
 LOCK_FILE = ".sosmonitor.lock"
+PROC = "/proc"  # Linux process info; tests point it at a fake tree
 LOG_MAX_BYTES = 5_000_000
 TIMEOUT = 15
 METRIC_LABELS = {"cpu": "CPU", "memory": "Memory", "disk": "Disk"}
@@ -141,23 +146,25 @@ def file_in(cfg: dict, name: str) -> Path:
 
 
 # ============================================================
-# METRICS
+# METRICS BACKEND (everything that differs with psutil or /proc)
 # ============================================================
+# Each public function picks psutil when installed, else reads /proc (Linux).
+# To support a new backend, change only this section.
 
-def read_cpu_counters() -> Optional[Tuple[float, float]]:
-    """Cumulative (busy, total) CPU time of the whole system, or None."""
-    if psutil:
-        try:
-            times = psutil.cpu_times()
-            # guest times are already counted inside user/nice
-            total = sum(v for k, v in times._asdict().items() if not k.startswith("guest"))
-            idle = times.idle + getattr(times, "iowait", 0.0)
-            return total - idle, total
-        except (OSError, AttributeError):
-            return None
-
+def _psutil_cpu_counters() -> Optional[Tuple[float, float]]:
     try:
-        with open("/proc/stat", encoding="utf-8") as file:
+        times = psutil.cpu_times()
+        # guest times are already counted inside user/nice
+        total = sum(v for k, v in times._asdict().items() if not k.startswith("guest"))
+        idle = times.idle + getattr(times, "iowait", 0.0)
+        return total - idle, total
+    except (OSError, AttributeError):
+        return None
+
+
+def _proc_cpu_counters() -> Optional[Tuple[float, float]]:
+    try:
+        with open(f"{PROC}/stat", encoding="utf-8") as file:
             values = [int(x) for x in file.readline().split()[1:]]
         idle = values[3] + (values[4] if len(values) > 4 else 0)
         total = sum(values[:8])
@@ -165,6 +172,183 @@ def read_cpu_counters() -> Optional[Tuple[float, float]]:
     except (OSError, ValueError, IndexError):
         return None
 
+
+def read_cpu_counters() -> Optional[Tuple[float, float]]:
+    """Cumulative (busy, total) CPU time of the whole system, or None."""
+    return _psutil_cpu_counters() if psutil else _proc_cpu_counters()
+
+
+def _psutil_memory() -> dict:
+    memory = psutil.virtual_memory()
+    return {
+        "percent": round(memory.percent, 1),
+        "total_bytes": memory.total,
+        "available_bytes": memory.available,
+        "used_bytes": memory.used,
+    }
+
+
+def _proc_memory() -> Optional[dict]:
+    try:
+        info: Dict[str, int] = {}
+        with open(f"{PROC}/meminfo", encoding="utf-8") as file:
+            for line in file:
+                key, value = line.split(":", 1)
+                info[key] = int(value.split()[0]) * 1024
+
+        total = info["MemTotal"]
+        available = info.get(
+            "MemAvailable",
+            info["MemFree"] + info.get("Buffers", 0) + info.get("Cached", 0),
+        )
+        used = total - available
+        return {
+            "percent": round(used / total * 100, 1),
+            "total_bytes": total,
+            "available_bytes": available,
+            "used_bytes": used,
+        }
+    except (OSError, KeyError, ValueError, ZeroDivisionError):
+        return None
+
+
+def get_memory_usage() -> Optional[dict]:
+    return _psutil_memory() if psutil else _proc_memory()
+
+
+def get_load_average() -> Optional[dict]:
+    try:
+        load_1, load_5, load_15 = (psutil or os).getloadavg()
+    except (AttributeError, OSError):
+        return None
+
+    cpu_count = os.cpu_count() or 1
+    return {
+        "1m": round(load_1, 2),
+        "5m": round(load_5, 2),
+        "15m": round(load_15, 2),
+        "cpu_count": cpu_count,
+        "1m_per_cpu": round(load_1 / cpu_count, 2),
+    }
+
+
+def _psutil_top_memory(deadline: float) -> Tuple[List[Tuple[str, int]], int]:
+    """([(name, rss_bytes)], total memory in bytes)."""
+    rows: List[Tuple[str, int]] = []
+    for proc in psutil.process_iter(["name", "memory_info"]):
+        if time.monotonic() > deadline:
+            break
+        info = proc.info
+        if info.get("memory_info") is not None and _clean_name(info.get("name")):
+            rows.append((_clean_name(info["name"]), info["memory_info"].rss))
+    return rows, psutil.virtual_memory().total
+
+
+def _proc_rss() -> Dict[int, Tuple[str, int]]:
+    """{pid: (name, resident bytes)} from /proc (Linux). Needs no `ps`, so it
+    also works on busybox/Alpine. Empty when /proc is missing."""
+    rss: Dict[int, Tuple[str, int]] = {}
+    try:
+        entries = os.listdir(PROC)
+        page_size = os.sysconf("SC_PAGE_SIZE")
+    except (OSError, ValueError, AttributeError):
+        return rss
+    for entry in entries:
+        if not entry.isdigit():
+            continue
+        try:
+            with open(f"{PROC}/{entry}/statm", encoding="utf-8") as file:
+                pages = int(file.read().split()[1])
+            with open(f"{PROC}/{entry}/stat", encoding="utf-8", errors="replace") as file:
+                text = file.read()
+            rss[int(entry)] = (text[text.index("(") + 1:text.rindex(")")], pages * page_size)
+        except (OSError, ValueError, IndexError):
+            continue  # process gone or not readable
+    return rss
+
+
+def _proc_top_memory(deadline: float) -> Tuple[List[Tuple[str, int]], int]:
+    rows: List[Tuple[str, int]] = []
+    for name, size in _proc_rss().values():
+        if time.monotonic() > deadline:
+            break
+        if _clean_name(name):
+            rows.append((_clean_name(name), size))
+    return rows, (get_memory_usage() or {}).get("total_bytes", 0)
+
+
+def top_memory(count: int) -> List[dict]:
+    """Largest processes by RSS (instantaneous)."""
+    deadline = time.monotonic() + TOP_TIMEOUT
+    rows, total = (_psutil_top_memory if psutil else _proc_top_memory)(deadline)
+    if not total:
+        return []
+    rows.sort(key=lambda row: row[1], reverse=True)
+    return [{"name": name, "percent": round(100.0 * rss / total, 1), "rss_bytes": rss}
+            for name, rss in rows[:count]]
+
+
+def _proc_cpu_ticks() -> Dict[int, Tuple[str, int]]:
+    """{pid: (name, utime+stime in clock ticks)} from /proc (Linux)."""
+    ticks: Dict[int, Tuple[str, int]] = {}
+    for entry in os.listdir(PROC):
+        if not entry.isdigit():
+            continue
+        try:
+            with open(f"{PROC}/{entry}/stat", encoding="utf-8", errors="replace") as file:
+                text = file.read()
+            name = text[text.index("(") + 1:text.rindex(")")]
+            fields = text[text.rindex(")") + 2:].split()
+            ticks[int(entry)] = (name, int(fields[11]) + int(fields[12]))
+        except (OSError, ValueError, IndexError):
+            continue  # process gone or not readable
+    return ticks
+
+
+def _psutil_top_cpu(deadline: float) -> List[Tuple[str, float]]:
+    rows: List[Tuple[str, float]] = []
+    procs = []
+    for proc in psutil.process_iter(["name"]):
+        try:
+            proc.cpu_percent(None)
+            procs.append(proc)
+        except psutil.Error:
+            continue
+    time.sleep(1)
+    for proc in procs:
+        if time.monotonic() > deadline:
+            break
+        try:
+            rows.append((_clean_name(proc.info.get("name")), proc.cpu_percent(None)))
+        except psutil.Error:
+            continue
+    return rows
+
+
+def _proc_top_cpu() -> List[Tuple[str, float]]:
+    first = _proc_cpu_ticks()
+    started = time.monotonic()
+    time.sleep(1)
+    second = _proc_cpu_ticks()
+    elapsed = max(time.monotonic() - started, 0.001)
+    hertz = os.sysconf("SC_CLK_TCK")
+    return [(_clean_name(name), 100.0 * (ticks - first[pid][1]) / hertz / elapsed)
+            for pid, (name, ticks) in second.items() if pid in first]
+
+
+def top_cpu(count: int) -> List[dict]:
+    """Biggest CPU consumers over a 1-second window (not `ps %cpu`, which is a
+    lifetime average)."""
+    deadline = time.monotonic() + TOP_TIMEOUT
+    rows = _psutil_top_cpu(deadline) if psutil else _proc_top_cpu()
+    rows = [(name, percent) for name, percent in rows if name and percent > 0]
+    rows.sort(key=lambda row: row[1], reverse=True)
+    return [{"name": name, "percent": round(percent, 1)} for name, percent in rows[:count]]
+
+
+# ============================================================
+# METRICS
+# ============================================================
 
 def _valid_sample(sample: Any) -> bool:
     return (isinstance(sample, dict)
@@ -198,39 +382,6 @@ def measure_cpu(previous: Optional[dict]) -> Tuple[Optional[float], Optional[dic
     return percent, {"busy": second[0], "total": second[1], "time": time.time()}
 
 
-def get_memory_usage() -> Optional[dict]:
-    if psutil:
-        memory = psutil.virtual_memory()
-        return {
-            "percent": round(memory.percent, 1),
-            "total_bytes": memory.total,
-            "available_bytes": memory.available,
-            "used_bytes": memory.used,
-        }
-
-    try:
-        info: Dict[str, int] = {}
-        with open("/proc/meminfo", encoding="utf-8") as file:
-            for line in file:
-                key, value = line.split(":", 1)
-                info[key] = int(value.split()[0]) * 1024
-
-        total = info["MemTotal"]
-        available = info.get(
-            "MemAvailable",
-            info["MemFree"] + info.get("Buffers", 0) + info.get("Cached", 0),
-        )
-        used = total - available
-        return {
-            "percent": round(used / total * 100, 1),
-            "total_bytes": total,
-            "available_bytes": available,
-            "used_bytes": used,
-        }
-    except (OSError, KeyError, ValueError, ZeroDivisionError):
-        return None
-
-
 def get_disk_usage(path: str) -> Optional[dict]:
     try:
         usage = shutil.disk_usage(path)
@@ -245,22 +396,6 @@ def get_disk_usage(path: str) -> Optional[dict]:
         "used_bytes": usage.used,
         "free_bytes": usage.free,
         "path": path,
-    }
-
-
-def get_load_average() -> Optional[dict]:
-    try:
-        load_1, load_5, load_15 = (psutil or os).getloadavg()
-    except (AttributeError, OSError):
-        return None
-
-    cpu_count = os.cpu_count() or 1
-    return {
-        "1m": round(load_1, 2),
-        "5m": round(load_5, 2),
-        "15m": round(load_15, 2),
-        "cpu_count": cpu_count,
-        "1m_per_cpu": round(load_1 / cpu_count, 2),
     }
 
 
@@ -401,95 +536,6 @@ def _clean_name(name: Any) -> str:
     """Command name only, never arguments (they can hold passwords and tokens)."""
     parts = os.path.basename(str(name or "").strip()).split()
     return parts[0][:TOP_NAME_WIDTH] if parts else ""
-
-
-def top_memory(count: int) -> List[dict]:
-    """Largest processes by RSS (instantaneous)."""
-    deadline = time.monotonic() + TOP_TIMEOUT
-    rows: List[Tuple[str, int]] = []
-
-    if psutil:
-        total = psutil.virtual_memory().total
-        for proc in psutil.process_iter(["name", "memory_info"]):
-            if time.monotonic() > deadline:
-                break
-            info = proc.info
-            if info.get("memory_info") is not None and _clean_name(info.get("name")):
-                rows.append((_clean_name(info["name"]), info["memory_info"].rss))
-    else:
-        result = subprocess.run(["ps", "-eo", "pid,comm,%mem,rss", "--sort=-rss"],
-                                capture_output=True, text=True, timeout=3)
-        if result.returncode != 0:
-            return []
-        total = (get_memory_usage() or {}).get("total_bytes", 0)
-        for line in result.stdout.splitlines()[1:]:
-            fields = line.split()
-            if len(fields) < 4 or not fields[-1].isdigit():
-                continue
-            name = _clean_name(" ".join(fields[1:-2]))
-            if name:
-                rows.append((name, int(fields[-1]) * 1024))
-
-    if not total:
-        return []
-    rows.sort(key=lambda row: row[1], reverse=True)
-    return [{"name": name, "percent": round(100.0 * rss / total, 1), "rss_bytes": rss}
-            for name, rss in rows[:count]]
-
-
-def _proc_cpu_ticks() -> Dict[int, Tuple[str, int]]:
-    """{pid: (name, utime+stime in clock ticks)} from /proc (Linux)."""
-    ticks: Dict[int, Tuple[str, int]] = {}
-    for entry in os.listdir("/proc"):
-        if not entry.isdigit():
-            continue
-        try:
-            with open(f"/proc/{entry}/stat", encoding="utf-8", errors="replace") as file:
-                text = file.read()
-            name = text[text.index("(") + 1:text.rindex(")")]
-            fields = text[text.rindex(")") + 2:].split()
-            ticks[int(entry)] = (name, int(fields[11]) + int(fields[12]))
-        except (OSError, ValueError, IndexError):
-            continue  # process gone or not readable
-    return ticks
-
-
-def top_cpu(count: int) -> List[dict]:
-    """Biggest CPU consumers over a 1-second window (not `ps %cpu`, which is a
-    lifetime average)."""
-    deadline = time.monotonic() + TOP_TIMEOUT
-    rows: List[Tuple[str, float]] = []
-
-    if psutil:
-        procs = []
-        for proc in psutil.process_iter(["name"]):
-            try:
-                proc.cpu_percent(None)
-                procs.append(proc)
-            except psutil.Error:
-                continue
-        time.sleep(1)
-        for proc in procs:
-            if time.monotonic() > deadline:
-                break
-            try:
-                rows.append((_clean_name(proc.info.get("name")), proc.cpu_percent(None)))
-            except psutil.Error:
-                continue
-    else:
-        first = _proc_cpu_ticks()
-        started = time.monotonic()
-        time.sleep(1)
-        second = _proc_cpu_ticks()
-        elapsed = max(time.monotonic() - started, 0.001)
-        hertz = os.sysconf("SC_CLK_TCK")
-        for pid, (name, ticks) in second.items():
-            if pid in first:
-                rows.append((_clean_name(name), 100.0 * (ticks - first[pid][1]) / hertz / elapsed))
-
-    rows = [(name, percent) for name, percent in rows if name and percent > 0]
-    rows.sort(key=lambda row: row[1], reverse=True)
-    return [{"name": name, "percent": round(percent, 1)} for name, percent in rows[:count]]
 
 
 def collect_top_processes(cfg: dict, alerts: List[dict]) -> Dict[str, List[dict]]:
@@ -774,6 +820,42 @@ def run_test(cfg: dict) -> int:
     return 1 if failed else 0
 
 
+# ============================================================
+# PLATFORM SERVICES (what depends on the operating system)
+# ============================================================
+# Config location, lock, scheduler (crontab vs Task Scheduler), the
+# `sosmonitor` command (POSIX only) and the config editor.
+
+# --- config location --------------------------------------------------
+
+def installed_as_package() -> bool:
+    """True when this file runs from an installed package (pip, pipx, uv)."""
+    return any(part in ("site-packages", "dist-packages") for part in SCRIPT.parts)
+
+
+def user_config_dir() -> Path:
+    """Per-user config folder, which survives package upgrades."""
+    if sys.platform == "win32":
+        appdata = os.environ.get("APPDATA")
+        base = Path(appdata) if appdata else Path.home() / "AppData" / "Roaming"
+        return base / "SOSMonitor"
+    xdg = os.environ.get("XDG_CONFIG_HOME")
+    base = Path(xdg) if xdg else Path.home() / ".config"
+    return base / "sosmonitor"
+
+
+def resolve_config_path(explicit: Optional[str]) -> Path:
+    """-c wins; then a config.json next to the script (every existing install
+    keeps working); otherwise the user config folder, where `install` and
+    `config` create a new one. Nothing is ever moved or copied."""
+    if explicit:
+        return Path(explicit)
+    beside = SCRIPT.parent / "config.json"
+    return beside if beside.exists() else user_config_dir() / "config.json"
+
+
+# --- lock -------------------------------------------------------------
+
 def acquire_lock(cfg: dict):
     """Returns a handle to keep alive, or None if another run holds the lock."""
     handle = open(file_in(cfg, LOCK_FILE), "w")
@@ -790,77 +872,216 @@ def acquire_lock(cfg: dict):
     return handle
 
 
-# ============================================================
-# CRON
-# ============================================================
+# --- step summary (install / uninstall) -------------------------------
 
-def crontab_read() -> Optional[str]:
-    """Current crontab text, or None when crontab is unavailable."""
+# A step is (label, status, detail). Statuses: created, ok, already (nothing
+# to do), manual (the user must act, nothing broke) and failed.
+Step = Tuple[str, str, str]
+
+MACOS_HINT = ("macOS blocks crontab until your terminal has Full Disk Access.\n"
+              "System Settings > Privacy & Security > Full Disk Access, enable\n"
+              "your terminal, restart it, then run: sosmonitor {action}")
+
+
+def print_summary(steps: List[Step]) -> None:
+    """One row per step, in columns. Extra detail lines sit under the status."""
+    for label, status, detail in steps:
+        first, *rest = (detail or "").split("\n")
+        print(f"{label:<11}{status:<10}{first}".rstrip())
+        for line in rest:
+            print(" " * 11 + line)
+
+
+def exit_code(steps: List[Step]) -> int:
+    """Only a real failure is an error. `manual` and `already` are not."""
+    return 1 if any(status == "failed" for _, status, _ in steps) else 0
+
+
+def _tilde(path: Any) -> str:
+    text, home = str(path), str(Path.home())
+    return "~" + text[len(home):] if text == home or text.startswith(home + os.sep) else text
+
+
+# --- scheduler (crontab; schtasks on Windows) -------------------------
+
+def _is_permission_error(message: str) -> bool:
+    lowered = message.lower()
+    return "not permitted" in lowered or "permission denied" in lowered
+
+
+def crontab_read() -> Tuple[str, str]:
+    """(state, text). States: "ok" (text is the current crontab, empty when the
+    user has none), "unavailable" (no `crontab` command), "denied" (permission
+    error, text is its message) and "error" (anything else). Never raises."""
     if not shutil.which("crontab"):
-        return None
-    result = subprocess.run(["crontab", "-l"], capture_output=True, text=True)
-    return result.stdout if result.returncode == 0 else ""
+        return "unavailable", ""
+    try:
+        result = subprocess.run(["crontab", "-l"], capture_output=True, text=True)
+    except OSError as error:
+        return ("denied" if isinstance(error, PermissionError) else "error"), str(error)
+    if result.returncode == 0:
+        return "ok", result.stdout
+    message = result.stderr.strip()
+    if _is_permission_error(message):
+        return "denied", message
+    if not message or "no crontab" in message.lower():  # the user has no crontab yet
+        return "ok", ""
+    return "error", message
 
 
-def crontab_write(lines: List[str]) -> None:
+def crontab_write(lines: List[str]) -> Tuple[bool, str]:
+    """(success, error message from crontab). Never raises."""
     text = "\n".join(lines) + ("\n" if lines else "")
-    subprocess.run(["crontab", "-"], input=text, text=True, check=True)
+    try:
+        result = subprocess.run(["crontab", "-"], input=text, text=True,
+                                capture_output=True)
+    except OSError as error:
+        return False, str(error)
+    if result.returncode == 0:
+        return True, ""
+    return False, result.stderr.strip() or f"crontab exited with code {result.returncode}"
 
 
-def install_cron(cfg: dict, config_path: Path) -> int:
+def crontab_failure(message: str, action: str) -> str:
+    """Detail text for a failed crontab call; adds the macOS fix when it applies."""
+    message = message[len("crontab: "):] if message.startswith("crontab: ") else message
+    detail = f"crontab: {message}"
+    if sys.platform == "darwin" and _is_permission_error(message):
+        detail += "\n" + MACOS_HINT.format(action=action)
+    return detail
+
+
+def _is_entry_point(path: Path) -> bool:
+    try:
+        return path.is_file() and path.resolve() != SCRIPT.resolve()
+    except OSError:
+        return False
+
+
+def find_entry_point(on_path_only: bool = False) -> Optional[Path]:
+    """The `sosmonitor` executable a package install (pip, pipx, uv) created, as
+    an absolute path. None when not running from a package. A link that
+    points at this script (the curl-install shortcut) doesn't count."""
+    if not installed_as_package():
+        return None
+    found = shutil.which("sosmonitor")
+    if found and _is_entry_point(Path(found)):
+        return Path(os.path.abspath(found))
+    if on_path_only:
+        return None
+    folders = [Path(sys.executable).parent, Path(site.getuserbase()) /
+               ("Scripts" if sys.platform == "win32" else "bin")]
+    scripts = sysconfig.get_path("scripts")
+    if scripts:
+        folders.insert(0, Path(scripts))
+    for folder in folders:
+        for name in ("sosmonitor", "sosmonitor.exe"):
+            if _is_entry_point(folder / name):
+                return Path(os.path.abspath(folder / name))
+    return None
+
+
+def cron_command(config_path: Path) -> str:
+    """Always absolute paths: cron's PATH can't be relied on."""
+    entry = find_entry_point()
+    if entry:
+        return f'"{entry}" -c "{config_path}" run'
+    return f'"{sys.executable}" "{SCRIPT}" -c "{config_path}" run'
+
+
+def schedule_step(cfg: dict, config_path: Path) -> Tuple[str, str]:
+    """Adds (or keeps) the crontab line. Returns (status, detail)."""
     minutes = min(59, max(1, int(cfg["check_interval_minutes"])))
-    command = f'"{sys.executable}" "{SCRIPT}" -c "{config_path}" run'
+    command = cron_command(config_path)
 
-    current = crontab_read()
-    if current is None:
+    state, current = crontab_read()
+    if state == "unavailable":
         if os.name == "nt":
             task = command.replace('"', '\\"')
-            print("No crontab on Windows. Schedule it with Task Scheduler:\n"
-                  f'  schtasks /Create /SC MINUTE /MO {minutes} /TN {TASK_NAME} /TR "{task}" /F')
-        else:
-            print("crontab not available. Add this to your panel's cron manager "
-                  f"(every {minutes} minute(s)):\n  {command}")
-        return 1
+            return "manual", ("no crontab on Windows. Schedule it with Task Scheduler:\n"
+                              f'  schtasks /Create /SC MINUTE /MO {minutes} /TN {TASK_NAME} /TR "{task}" /F')
+        return "manual", ("crontab not available. Add this to your panel's cron manager "
+                          f"(every {minutes} minute(s)):\n  {command}")
+    if state != "ok":
+        return "failed", crontab_failure(current, "install")
 
-    kept = [line for line in current.splitlines() if CRON_MARK not in line]
-    crontab_write(kept + [f"*/{minutes} * * * * {command} >/dev/null 2>&1 {CRON_MARK}"])
-    print(f"Cron installed: runs every {minutes} minute(s)")
-    return 0
+    line = f"*/{minutes} * * * * {command} >/dev/null 2>&1 {CRON_MARK}"
+    existing = current.splitlines()
+    if [entry for entry in existing if CRON_MARK in entry] == [line]:
+        return "already", f"every {minutes} minute(s)"
+
+    kept = [entry for entry in existing if CRON_MARK not in entry]
+    written, error = crontab_write(kept + [line])
+    if not written:
+        return "failed", crontab_failure(error, "install")
+    return "ok", f"every {minutes} minute(s)"
 
 
-def cmd_install(cfg: dict, config_path: Path, shortcut: bool = True) -> int:
-    code = install_cron(cfg, config_path)
+def cmd_install(cfg: dict, config_path: Path, shortcut: bool = True,
+                created: bool = False, explicit: Optional[str] = None) -> int:
+    """Runs every step even if one fails, then prints one summary."""
+    steps: List[Step] = [("Config", "created" if created else "already", str(config_path))]
+    notes: List[str] = []
     if shortcut and os.name != "nt":
-        install_shortcut()
-    return code
+        entry = find_entry_point(on_path_only=True)
+        if entry:  # a package install already put the command on PATH
+            steps.append(("Command", "already", f"sosmonitor ({_tilde(entry)})"))
+        else:
+            status, detail, extra = install_shortcut()
+            steps.append(("Command", status, detail))
+            notes += extra
+    status, detail = schedule_step(cfg, config_path)
+    steps.append(("Schedule", status, detail))
+
+    print_summary(steps)
+    next_steps = []
+    if created:
+        next_steps.append(f"Set server_name, webhook and/or email with:\n  "
+                          f"{_edit_command(explicit, config_path)}")
+        next_steps.append(f"Then check the channels with:\n  "
+                          f"{_edit_command(explicit, config_path, 'test')}")
+    next_steps += notes
+    if any(s == "failed" and "Full Disk Access" not in d for _, s, d in steps):
+        next_steps.append("Fix the error above, then run install again:\n  "
+                          f"{_edit_command(explicit, config_path, 'install')}")
+    if next_steps:
+        print("\nNext:\n" + "\n".join(f"- {text}" for text in next_steps))
+    return exit_code(steps)
 
 
-def uninstall_cron() -> None:
-    current = crontab_read()
-    if current is None and os.name == "nt":
-        print(f"No crontab on Windows. Remove the task with:\n  schtasks /Delete /TN {TASK_NAME} /F")
-        return
-    lines = (current or "").splitlines()
+def uninstall_cron() -> Tuple[str, str]:
+    """Removes the crontab line. Returns (status, detail)."""
+    state, current = crontab_read()
+    if state == "unavailable":
+        if os.name == "nt":
+            return "manual", f"no crontab on Windows. Remove the task with:\n  schtasks /Delete /TN {TASK_NAME} /F"
+        return "manual", f"crontab not available. Remove the line ending in `{CRON_MARK}` from your panel's cron manager"
+    if state != "ok":
+        return "failed", crontab_failure(current, "uninstall")
+
+    lines = current.splitlines()
     kept = [line for line in lines if CRON_MARK not in line]
-
     if len(kept) == len(lines):
-        print("No cron entry found")
-        return
+        return "already", "no cron entry found"
 
-    crontab_write(kept)
-    print("Cron entry removed")
+    written, error = crontab_write(kept)
+    if not written:
+        return "failed", crontab_failure(error, "uninstall")
+    return "ok", "cron entry removed"
 
 
 def cmd_uninstall() -> int:
-    uninstall_cron()
-    if os.name != "nt":
-        remove_shortcut()
-    return 0
+    steps: List[Step] = [("Cron entry",) + uninstall_cron()]
+    # With a package entry point and no link of ours, there is nothing we created.
+    if os.name != "nt" and not (find_entry_point(on_path_only=True) and not _own_link()):
+        steps += remove_shortcut()
+    print_summary(steps)
+    if any(s == "failed" and "Full Disk Access" not in d for _, s, d in steps):
+        print("\nNext:\n- Fix the error above, then run uninstall again.")
+    return exit_code(steps)
 
 
-# ============================================================
-# SHORTCUT (the `sosmonitor` command, Linux/macOS)
-# ============================================================
+# --- the `sosmonitor` command (Linux/macOS, curl install) -------------
 
 STARTUP_FILES = (".bashrc", ".bash_profile", ".profile", ".zshrc")
 PATH_LINE = 'export PATH="$HOME/.local/bin:$PATH"'
@@ -868,6 +1089,14 @@ PATH_LINE = 'export PATH="$HOME/.local/bin:$PATH"'
 
 def bin_dir() -> Path:
     return Path.home() / ".local" / "bin"
+
+
+def _own_link() -> bool:
+    link = bin_dir() / "sosmonitor"
+    try:
+        return link.is_symlink() and link.resolve() == SCRIPT.resolve()
+    except OSError:
+        return False
 
 
 def add_path_block(home: Path) -> List[Path]:
@@ -923,58 +1152,144 @@ def shell_finds_command() -> bool:
     return False
 
 
-def install_shortcut() -> None:
+def install_shortcut() -> Tuple[str, str, List[str]]:
+    """Links ~/.local/bin/sosmonitor to the script and puts that folder on PATH.
+    Returns (status, detail, next-step notes)."""
     folder = bin_dir()
     link = folder / "sosmonitor"
+    shown = f"sosmonitor ({_tilde(link)})"
     try:
         SCRIPT.chmod(SCRIPT.stat().st_mode | 0o111)
         folder.mkdir(parents=True, exist_ok=True)
-        if link.is_symlink():
-            link.unlink()
-        elif link.exists():
-            print(f"WARNING: {link} already exists and is not a link; left it untouched. "
-                  f"Run the script with its full path: {SCRIPT}")
-            return
-        link.symlink_to(SCRIPT)
+        linked = _own_link()
+        if not linked:
+            if link.is_symlink():
+                link.unlink()
+            elif link.exists():
+                return "manual", (f"{_tilde(link)} exists and is not a link; left it untouched.\n"
+                                  f"Run the script with its full path: {SCRIPT}"), []
+            link.symlink_to(SCRIPT)
     except OSError as error:
-        print(f"WARNING: could not create the sosmonitor command: {error}")
-        return
+        return "failed", f"could not create {_tilde(link)}: {error}", []
 
     on_path = {os.path.normpath(os.path.expanduser(entry))
                for entry in os.environ.get("PATH", "").split(os.pathsep) if entry}
     if os.path.normpath(str(folder)) in on_path:
-        print("Command installed: sosmonitor")
-        return
+        return ("already" if linked else "ok"), shown, []
 
+    status, detail = ("already" if linked else "ok"), shown
     try:
         changed = add_path_block(Path.home())
     except OSError as error:
-        print(f"WARNING: could not update shell startup files: {error}")
-        changed = []
+        return "manual", (f"{shown}\ncould not update shell startup files: {error}\n"
+                          f"Add this line to your startup file yourself: {PATH_LINE}"), []
     if changed:
-        print("Added ~/.local/bin to PATH in: " + ", ".join(p.name for p in changed))
-
-    if shell_finds_command():
-        print(f"Command installed: sosmonitor ({link})")
-    else:
-        print("WARNING: could not confirm that a new shell finds `sosmonitor`; this host's "
-              f"shell may not load startup files. Use the full path instead: {link}")
-    print("Open a new session to use `sosmonitor`, or run this to use it right now:\n"
-          f"  {PATH_LINE}")
+        status = "ok"
+        detail += "\nadded ~/.local/bin to PATH in: " + ", ".join(p.name for p in changed)
+    if not shell_finds_command():
+        detail += ("\ncould not confirm that a new shell finds `sosmonitor`; this host's shell "
+                   f"may not load startup files. Use the full path: {link}")
+    return status, detail, ["Open a new session to use `sosmonitor`, or run this to use it right now:\n"
+                            f"  {PATH_LINE}"]
 
 
-def remove_shortcut() -> None:
+def remove_shortcut() -> List[Step]:
+    """Removes our link and PATH block. Returns one step for each."""
     link = bin_dir() / "sosmonitor"
+    steps: List[Step] = []
     try:
-        if link.is_symlink() and link.resolve() == SCRIPT.resolve():
+        if _own_link():
             link.unlink()
-            print(f"Command removed: {link}")
-        changed = remove_path_block(Path.home())
+            steps.append(("Command", "ok", f"removed {_tilde(link)}"))
+        else:
+            steps.append(("Command", "already", "no link of ours to remove"))
     except OSError as error:
-        print(f"WARNING: could not remove the sosmonitor command: {error}")
-        return
-    if changed:
-        print("Removed the PATH line from: " + ", ".join(p.name for p in changed))
+        steps.append(("Command", "failed", f"could not remove {_tilde(link)}: {error}"))
+    try:
+        changed = remove_path_block(Path.home())
+        steps.append(("PATH block", "ok" if changed else "already",
+                      "removed from: " + ", ".join(p.name for p in changed) if changed
+                      else "no PATH block found"))
+    except OSError as error:
+        steps.append(("PATH block", "failed", f"could not update shell startup files: {error}"))
+    return steps
+
+
+# --- config editor ----------------------------------------------------
+
+def pick_editor() -> Optional[List[str]]:
+    """$VISUAL, then $EDITOR, then nano, then vi (notepad on Windows)."""
+    for var in ("VISUAL", "EDITOR"):
+        try:
+            parts = shlex.split(os.environ.get(var, ""))
+        except ValueError:
+            continue
+        if parts and shutil.which(parts[0]):
+            return parts
+    for name in (("notepad",) if sys.platform == "win32" else ("nano", "vi")):
+        if shutil.which(name):
+            return [name]
+    return None
+
+
+def _quote(text: str) -> str:
+    return f'"{text}"' if sys.platform == "win32" else shlex.quote(text)
+
+
+def _config_problem(path: Path) -> Optional[str]:
+    """Why the config can't be loaded, or None when it is fine."""
+    try:
+        load_config(path)
+    except SystemExit as error:
+        return str(error)
+    except (OSError, UnicodeDecodeError) as error:
+        return f"cannot read {path}: {error}"
+    return None
+
+
+def cmd_config(path: Path) -> int:
+    """Creates the config if missing and opens it in an editor. Without an
+    interactive terminal or an editor it only prints the path and a command to
+    copy, so it can never hang."""
+    if not path.exists():
+        create_config(path)
+        print(f"Config created: {path}")
+
+    editor = pick_editor()
+    shown = editor or ["notepad" if sys.platform == "win32" else "nano"]
+    command = " ".join(_quote(part) for part in shown + [str(path)])
+    if not (editor and sys.stdin.isatty() and sys.stdout.isatty()):
+        print(f"Config file: {path}\nOpen it with:\n  {command}")
+        return 0
+
+    for attempt in (1, 2):
+        try:
+            subprocess.run(editor + [str(path)])
+        except OSError as error:
+            print(f"Could not start {editor[0]}: {error}\nOpen it with:\n  {command}")
+            return 1
+        problem = _config_problem(path)
+        if problem is None:
+            print(f"Config OK: {path}")
+            return 0
+        print(f"Invalid config: {problem}", file=sys.stderr)
+        if attempt == 2:
+            break
+        try:
+            answer = input("Reopen the editor? [Y/n] ")
+        except EOFError:
+            break
+        if answer.strip().lower().startswith("n"):
+            break
+    return 1
+
+
+def _edit_command(explicit: Optional[str], path: Path, command: str = "config") -> str:
+    """A command as the user can type it (`-c` only when the config is not at
+    its default place)."""
+    base = "sosmonitor" if find_entry_point(on_path_only=True) or _own_link() \
+        else "python3 sosmonitor.py"
+    return f"{base} -c {_quote(str(path))} {command}" if explicit else f"{base} {command}"
 
 
 # ============================================================
@@ -985,9 +1300,10 @@ def main(argv: Optional[List[str]] = None) -> int:
     parser = argparse.ArgumentParser(prog="sosmonitor", description=__doc__,
                                      formatter_class=argparse.RawDescriptionHelpFormatter)
     parser.add_argument("command", nargs="?", default="run",
-                        choices=["run", "test", "install", "uninstall"])
-    parser.add_argument("-c", "--config", default=str(SCRIPT.parent / "config.json"),
-                        help="path to config.json (default: next to the script)")
+                        choices=["run", "test", "config", "install", "uninstall"])
+    parser.add_argument("-c", "--config", default=None,
+                        help="path to config.json (default: next to the script, or the "
+                             "user config folder when installed as a package)")
     parser.add_argument("--no-shortcut", action="store_true",
                         help="install: don't create the sosmonitor command or touch PATH")
     parser.add_argument("--version", action="version", version=f"SOSMonitor {VERSION}")
@@ -996,19 +1312,30 @@ def main(argv: Optional[List[str]] = None) -> int:
     if args.command == "uninstall":
         return cmd_uninstall()
 
-    config_path = Path(args.config).resolve()
+    config_path = resolve_config_path(args.config).resolve()
+    if args.command == "config":
+        return cmd_config(config_path)
+    created = False
     if not config_path.exists():
-        create_config(config_path)
-        print(f"Config created: {config_path}\n"
-              "Edit it (server_name, thresholds, webhook, email) and run again.")
-        return 0
+        if args.command != "install":
+            hint = "python3 sosmonitor.py install" if not args.config else \
+                f"python3 sosmonitor.py -c {_quote(str(config_path))} install"
+            print(f"No config file found. Run: {hint}", file=sys.stderr)
+            return 1
+        try:
+            create_config(config_path)
+        except OSError as error:
+            print_summary([("Config", "failed", f"{config_path}: {error}")])
+            return 1
+        created = True
 
     cfg = load_config(config_path)
 
     if args.command == "test":
         return run_test(cfg)
     if args.command == "install":
-        return cmd_install(cfg, config_path, shortcut=not args.no_shortcut)
+        return cmd_install(cfg, config_path, shortcut=not args.no_shortcut,
+                           created=created, explicit=args.config)
 
     lock = acquire_lock(cfg)
     if lock is None:

@@ -6,6 +6,7 @@ on:
 
 permissions:
   contents: write
+  id-token: write  # PyPI Trusted Publishing (OIDC), no token stored
 
 jobs:
   release:
@@ -70,3 +71,26 @@ jobs:
           name: ${{ steps.ver.outputs.tag }}
           body_path: notes.md
           files: sosmonitor.py
+
+      # PyPI never accepts the same version twice. Not gated on the tag check,
+      # so a failed publish is retried on the next push of the same version.
+      - name: Build sdist and wheel
+        run: |
+          python3 -m pip install --upgrade build
+          python3 -m build
+
+      - name: Check if this version is already on PyPI
+        id: pypi
+        run: |
+          code=$(curl -s -o /dev/null -w '%{http_code}' \
+            "https://pypi.org/pypi/sosmonitor/${{ steps.ver.outputs.version }}/json")
+          if [ "$code" = "200" ]; then
+            echo "sosmonitor ${{ steps.ver.outputs.version }} is already on PyPI, skipping publish."
+            echo "exists=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "exists=false" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Publish to PyPI
+        if: steps.pypi.outputs.exists == 'false'
+        uses: pypa/gh-action-pypi-publish@release/v1

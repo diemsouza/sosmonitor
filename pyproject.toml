@@ -1,0 +1,44 @@
+[build-system]
+requires = ["setuptools>=61"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "sosmonitor"
+dynamic = ["version"]
+description = "Simple server monitor: CPU, memory, disk and load alerts by webhook or email. One file, no root, no dependencies."
+readme = "README.md"
+requires-python = ">=3.8"
+license = {text = "MIT"}
+keywords = ["monitoring", "server", "alerts", "webhook", "cron", "n8n"]
+dependencies = []
+classifiers = [
+    "Development Status :: 4 - Beta",
+    "Environment :: Console",
+    "Intended Audience :: System Administrators",
+    "License :: OSI Approved :: MIT License",
+    "Operating System :: POSIX :: Linux",
+    "Operating System :: MacOS",
+    "Operating System :: Microsoft :: Windows",
+    "Programming Language :: Python :: 3",
+    "Programming Language :: Python :: 3 :: Only",
+    "Topic :: System :: Monitoring",
+    "Topic :: System :: Systems Administration",
+]
+
+[project.optional-dependencies]
+psutil = ["psutil>=5.9"]
+
+[project.scripts]
+sosmonitor = "sosmonitor:main"
+
+[project.urls]
+Homepage = "https://github.com/diemsouza/sosmonitor"
+Repository = "https://github.com/diemsouza/sosmonitor"
+Changelog = "https://github.com/diemsouza/sosmonitor/blob/main/CHANGELOG.md"
+Issues = "https://github.com/diemsouza/sosmonitor/issues"
+
+[tool.setuptools]
+py-modules = ["sosmonitor"]
+
+[tool.setuptools.dynamic]
+version = {attr = "sosmonitor.VERSION"}

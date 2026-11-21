@@ -2,6 +2,47 @@
 
 Every version lists what was added, changed and fixed, plus a **Config changes** line: keys that were added, renamed or removed in `config.json` ("none" when nothing changed). Keys missing from your `config.json` always use their default value, so a new key never breaks an old config. See [Updating](README.md#updating).
 
+## 0.3.1 - 2026-11-21
+
+### Added
+
+- `install` and `uninstall` end with a summary of each step (`Config`, `Command`, `Schedule`; `Cron entry`, `Command`, `PATH block`) and its status: `created`, `ok`, `already`, `manual` or `failed`. It is followed by the next actions that apply.
+- On macOS, when `crontab` is blocked ("Operation not permitted"), the summary explains how to give your terminal Full Disk Access and to run `install` again.
+
+### Changed
+
+- `install` runs every step even if one fails, so a crontab error no longer hides the config and the command that were set up. Exit code: 0 when everything is done, already done, or needs a manual action (a host without `crontab` now exits 0 after printing the line for your panel); non-zero only when a step failed.
+- `install` run again does not touch what already exists: no duplicate cron line, no new link, no rewritten config.
+- `uninstall` reports each step the same way.
+
+### Fixed
+
+- `install` crashed with a traceback when `crontab` refused to write (for example macOS without Full Disk Access), after having printed "Config created".
+- "No crontab yet" and "permission denied" were treated as the same thing when reading the crontab.
+
+**Config changes:** none.
+
+## 0.3.0 - 2026-11-21
+
+### Added
+
+- Install as a Python package: `pipx install sosmonitor` (or `uv tool install sosmonitor`, or `pip install --user sosmonitor`) creates the `sosmonitor` command by itself. `pip install sosmonitor[psutil]` adds `psutil` for macOS and Windows. The single-file `curl` install still works and is still the main way.
+- `sosmonitor config`: creates the config if missing and opens it in `$VISUAL`, `$EDITOR`, `nano` or `vi` (`notepad` on Windows). It checks the JSON when the editor closes and offers to reopen it once. Without an interactive terminal or an editor it only prints the path and a command to copy.
+- Releases are also published to PyPI (Trusted Publishing, built by the release workflow).
+
+### Changed
+
+- A new config is created in your user config folder (`$XDG_CONFIG_HOME/sosmonitor/` or `~/.config/sosmonitor/`, `%APPDATA%\SOSMonitor\` on Windows), so package upgrades don't delete it. An existing `config.json` next to the script is still used first, and `-c` still wins. Log, state and lock stay next to the config. Nothing is moved or copied.
+- `run` and `test` no longer create a config. Without one they print "No config file found" and point to `install`. `install` now creates the config (printing where), then schedules cron and the command, and ends by pointing to `sosmonitor config`.
+- `install` no longer creates the `~/.local/bin` link or touches shell startup files when a package install already put `sosmonitor` on your `PATH`. The cron line then runs that executable. `uninstall` only removes what `install` created.
+- Internal: platform-specific code is grouped in two sections of `sosmonitor.py` (metrics backend and platform services). No behavior change.
+
+### Fixed
+
+- Top memory consumers were silently missing on Alpine and other busybox hosts, where `ps` lacks `--sort`. They are now read from `/proc`, so no `ps` is needed.
+
+**Config changes:** none.
+
 ## 0.2.0 - 2026-11-20
 
 ### Added

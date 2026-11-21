@@ -11,3 +11,8 @@ config*.json
 
 # Python
 __pycache__/
+
+# Packaging
+build/
+dist/
+*.egg-info/

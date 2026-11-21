@@ -1,6 +1,7 @@
 import contextlib
 import io
 import json
+import shutil
 import sys
 import tempfile
 import unittest
@@ -15,6 +16,14 @@ import sosmonitor as sm  # noqa: E402
 
 def cpu(value):
     return {"cpu": {"percent": value}}
+
+
+SHORTCUT_OK = ("ok", "sosmonitor (~/.local/bin/sosmonitor)", [])
+
+
+def read_result(current):
+    """What crontab_read returns for a given crontab text (None: no command)."""
+    return ("unavailable", "") if current is None else ("ok", current)
 
 
 def make_cfg(webhook=False, email=False, every_check=True):
@@ -199,13 +208,38 @@ class ConfigTests(unittest.TestCase):
         example = json.loads((ROOT / "config.example.json").read_text())
         self.assertEqual(example, sm.build_template("MY-SERVER"))
 
-    def test_missing_config_is_created_without_running(self):
-        with mock.patch.object(sm, "run_once") as run:
-            code, out = cli("-c", str(self.path))
+    def test_missing_config_is_not_created_by_run_or_test(self):
+        for command in ("run", "test"):
+            with mock.patch.object(sm, "run_once") as run, \
+                    contextlib.redirect_stderr(io.StringIO()) as err:
+                code, out = cli("-c", str(self.path), command)
+            self.assertEqual(code, 1)
+            self.assertIn("No config file found", err.getvalue())
+            self.assertIn("install", err.getvalue())
+            self.assertFalse(self.path.exists())
+            run.assert_not_called()
+
+    def test_install_creates_missing_config_then_continues(self):
+        with mock.patch.object(sm, "crontab_read", return_value=("ok", "")), \
+                mock.patch.object(sm, "crontab_write", return_value=(True, "")) as write, \
+                mock.patch.object(sm, "install_shortcut", return_value=SHORTCUT_OK):
+            code, out = cli("-c", str(self.path), "install")
         self.assertEqual(code, 0)
-        self.assertIn("Config created", out)
         self.assertTrue(self.path.exists())
-        run.assert_not_called()
+        self.assertIn(f"Config     created   {self.path.resolve()}", out)
+        write.assert_called_once()
+        self.assertIn(f"{self.path.resolve()} config", out)
+        self.assertIn(f"{self.path.resolve()} test", out)
+        self.assertNotIn("nano", out)
+
+    def test_install_keeps_existing_config_and_prints_no_edit_hint(self):
+        self.path.write_text("{}")
+        with mock.patch.object(sm, "crontab_read", return_value=("ok", "")), \
+                mock.patch.object(sm, "crontab_write", return_value=(True, "")), \
+                mock.patch.object(sm, "install_shortcut", return_value=SHORTCUT_OK):
+            _, out = cli("-c", str(self.path), "install")
+        self.assertIn("Config     already", out)
+        self.assertNotIn("Set server_name", out)
 
     def test_existing_config_is_never_overwritten(self):
         self.path.write_text(json.dumps({"server_name": "CUSTOM"}))
@@ -220,13 +254,21 @@ class ConfigTests(unittest.TestCase):
         self.assertEqual(cfg["thresholds"], [(60, "médio"), (95, "alto")])
         self.assertIs(cfg["webhook"]["enabled"], False)
 
-    def test_default_config_is_next_to_script(self):
-        default = Path(self.tmp.name) / "config.json"
-        with mock.patch.object(sm, "SCRIPT", Path(self.tmp.name) / "sosmonitor.py"):
-            code, out = cli()
+    def test_default_config_is_created_in_user_dir_by_install(self):
+        xdg = Path(self.tmp.name) / "xdg"
+        script = Path(self.tmp.name) / "app" / "sosmonitor.py"
+        with mock.patch.dict(sm.os.environ, {"XDG_CONFIG_HOME": str(xdg)}), \
+                mock.patch.object(sm, "SCRIPT", script), \
+                mock.patch.object(sm, "crontab_read", return_value=("ok", "")), \
+                mock.patch.object(sm, "crontab_write", return_value=(True, "")), \
+                mock.patch.object(sm, "install_shortcut", return_value=SHORTCUT_OK):
+            code, out = cli("install")
+        default = xdg / "sosmonitor" / "config.json"
         self.assertEqual(code, 0)
         self.assertTrue(default.exists())
+        self.assertFalse((script.parent / "config.json").exists())
         self.assertIn(str(default), out)
+        self.assertIn("python3 sosmonitor.py config", out)
 
     def test_old_config_missing_new_key_uses_default(self):
         old = sm.build_template("OLD")
@@ -247,9 +289,9 @@ class ConfigTests(unittest.TestCase):
         # Hand-edited formatting and a missing key must survive untouched.
         self.path.write_text('{ "server_name": "HAND",\n\t"disk_path": "/data" }')
         before = self.path.read_bytes()
-        with mock.patch.object(sm, "crontab_read", return_value=""), \
-                mock.patch.object(sm, "crontab_write"), \
-                mock.patch.object(sm, "install_shortcut"):
+        with mock.patch.object(sm, "crontab_read", return_value=("ok", "")), \
+                mock.patch.object(sm, "crontab_write", return_value=(True, "")), \
+                mock.patch.object(sm, "install_shortcut", return_value=SHORTCUT_OK):
             for _ in range(2):
                 code, _ = cli("-c", str(self.path), "install")
                 self.assertEqual(code, 0)
@@ -277,8 +319,8 @@ class CronTests(unittest.TestCase):
 
     def install(self, current, os_name="posix"):
         out = io.StringIO()
-        with mock.patch.object(sm, "crontab_read", return_value=current), \
-                mock.patch.object(sm, "crontab_write") as write, \
+        with mock.patch.object(sm, "crontab_read", return_value=read_result(current)), \
+                mock.patch.object(sm, "crontab_write", return_value=(True, "")) as write, \
                 mock.patch.object(sm.os, "name", os_name), \
                 contextlib.redirect_stdout(out):
             code = sm.cmd_install(self.cfg, self.path, shortcut=False)
@@ -301,7 +343,8 @@ class CronTests(unittest.TestCase):
 
     def test_install_without_crontab_prints_command(self):
         code, write, out = self.install(None)
-        self.assertEqual(code, 1)
+        self.assertEqual(code, 0)  # nothing broke: the user pastes the line in the panel
+        self.assertIn("manual", out)
         write.assert_not_called()
         self.assertIn(f'-c "{self.path}" run', out)
 
@@ -311,12 +354,185 @@ class CronTests(unittest.TestCase):
 
     def test_uninstall_removes_only_tagged_line(self):
         current = f"0 * * * * backup\n* * * * * x {sm.CRON_MARK}\n"
-        with mock.patch.object(sm, "crontab_read", return_value=current), \
-                mock.patch.object(sm, "crontab_write") as write, \
+        with mock.patch.object(sm, "crontab_read", return_value=read_result(current)), \
+                mock.patch.object(sm, "crontab_write", return_value=(True, "")) as write, \
                 mock.patch.object(sm, "remove_shortcut"), \
                 contextlib.redirect_stdout(io.StringIO()):
             sm.cmd_uninstall()
         write.assert_called_once_with(["0 * * * * backup"])
+
+
+class CrontabPrimitiveTests(unittest.TestCase):
+    def run_read(self, returncode, stderr="", stdout=""):
+        result = mock.Mock(returncode=returncode, stderr=stderr, stdout=stdout)
+        with mock.patch.object(sm.shutil, "which", return_value="/usr/bin/crontab"), \
+                mock.patch.object(sm.subprocess, "run", return_value=result):
+            return sm.crontab_read()
+
+    def test_read_without_command_is_unavailable(self):
+        with mock.patch.object(sm.shutil, "which", return_value=None):
+            self.assertEqual(sm.crontab_read(), ("unavailable", ""))
+
+    def test_read_permission_denied_keeps_original_message(self):
+        message = "crontab: Operation not permitted"
+        self.assertEqual(self.run_read(1, message), ("denied", message))
+
+    def test_read_no_crontab_yet_is_an_empty_success(self):
+        self.assertEqual(self.run_read(1, "no crontab for diego"), ("ok", ""))
+
+    def test_read_success_returns_text(self):
+        self.assertEqual(self.run_read(0, stdout="* * * * * x\n"), ("ok", "* * * * * x\n"))
+
+    def test_read_other_error_is_reported_not_raised(self):
+        state, message = self.run_read(2, "crontab: bad thing")
+        self.assertEqual((state, message), ("error", "crontab: bad thing"))
+        with mock.patch.object(sm.shutil, "which", return_value="/usr/bin/crontab"), \
+                mock.patch.object(sm.subprocess, "run", side_effect=OSError("boom")):
+            self.assertEqual(sm.crontab_read(), ("error", "boom"))
+
+    def test_write_failure_returns_error_instead_of_raising(self):
+        result = mock.Mock(returncode=1, stderr="crontab: Operation not permitted\n")
+        with mock.patch.object(sm.subprocess, "run", return_value=result) as run:
+            self.assertEqual(sm.crontab_write(["a"]),
+                             (False, "crontab: Operation not permitted"))
+        self.assertNotIn("check", run.call_args.kwargs)
+        with mock.patch.object(sm.subprocess, "run", side_effect=OSError("boom")):
+            self.assertEqual(sm.crontab_write(["a"]), (False, "boom"))
+
+    def test_write_success(self):
+        with mock.patch.object(sm.subprocess, "run", return_value=mock.Mock(returncode=0)):
+            self.assertEqual(sm.crontab_write(["a"]), (True, ""))
+
+
+class InstallSummaryTests(unittest.TestCase):
+    """install/uninstall in a scratch HOME, with a fake crontab."""
+
+    DENIED = ("denied", "crontab: Operation not permitted")
+
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(self.tmp.cleanup)
+        root = Path(self.tmp.name)
+        self.home = root / "home"
+        self.home.mkdir()
+        self.script = root / "app" / "sosmonitor.py"
+        self.script.parent.mkdir()
+        self.script.write_text("#!/usr/bin/env python3\n")
+        self.config = root / "cfg" / "config.json"
+        self.crontab = ""  # what the fake crontab holds
+        for patch in (
+            mock.patch.dict(sm.os.environ, {"HOME": str(self.home), "PATH": "/usr/bin:/bin"}),
+            mock.patch.object(sm, "SCRIPT", self.script),
+            mock.patch.object(sm, "shell_finds_command", return_value=True),
+            mock.patch.object(sm, "find_entry_point", return_value=None),
+        ):
+            patch.start()
+            self.addCleanup(patch.stop)
+
+    def fake_write(self, lines):
+        self.crontab = "\n".join(lines) + "\n"
+        return True, ""
+
+    def run_cli(self, command, read=None, write=None, platform=None):
+        read = read or (lambda: ("ok", self.crontab))
+        out = io.StringIO()
+        with mock.patch.object(sm, "crontab_read", side_effect=read), \
+                mock.patch.object(sm, "crontab_write", side_effect=write or self.fake_write), \
+                mock.patch.object(sm.sys, "platform", platform or sys.platform), \
+                contextlib.redirect_stdout(out):
+            code = sm.main(["-c", str(self.config), command])
+        return code, out.getvalue()
+
+    def link(self):
+        return self.home / ".local" / "bin" / "sosmonitor"
+
+    def test_denied_schedule_still_creates_config_and_command(self):
+        code, out = self.run_cli("install", read=lambda: self.DENIED, platform="darwin")
+        self.assertNotEqual(code, 0)
+        self.assertTrue(self.config.exists())
+        self.assertTrue(self.link().is_symlink())
+        rows = [line.split()[0] for line in out.splitlines() if line[:1].isalpha()][:3]
+        self.assertEqual(rows, ["Config", "Command", "Schedule"])
+        self.assertIn("Schedule   failed    crontab: Operation not permitted", out)
+        self.assertIn("Full Disk Access", out)
+        self.assertIn("then run: sosmonitor install", out)
+
+    def test_denied_write_is_reported_not_raised(self):
+        code, out = self.run_cli("install", write=lambda lines: (False, "crontab: Operation not permitted"),
+                                 platform="darwin")
+        self.assertNotEqual(code, 0)
+        self.assertIn("Schedule   failed", out)
+        self.assertIn("Full Disk Access", out)
+        self.assertTrue(self.link().is_symlink())
+
+    def test_denied_on_linux_has_no_macos_hint_but_a_fix_line(self):
+        code, out = self.run_cli("install", read=lambda: self.DENIED, platform="linux")
+        self.assertNotEqual(code, 0)
+        self.assertNotIn("Full Disk Access", out)
+        self.assertIn("Fix the error above", out)
+
+    def test_host_without_crontab_is_manual_and_exits_zero(self):
+        code, out = self.run_cli("install", read=lambda: ("unavailable", ""))
+        self.assertEqual(code, 0)
+        self.assertIn("Schedule   manual", out)
+        self.assertIn(f'-c "{self.config.resolve()}" run', out)
+
+    def test_install_twice_does_not_duplicate_or_rewrite(self):
+        self.assertEqual(self.run_cli("install")[0], 0)
+        config_bytes = self.config.read_bytes()
+        link_stat = sm.os.lstat(self.link())
+        bashrc = (self.home / ".bashrc").read_text()
+        crontab = self.crontab
+        code, out = self.run_cli("install")
+        self.assertEqual(code, 0)
+        self.assertEqual(self.crontab, crontab)
+        self.assertEqual(self.crontab.count(sm.CRON_MARK), 1)
+        self.assertEqual(self.config.read_bytes(), config_bytes)
+        self.assertEqual(sm.os.lstat(self.link()).st_ino, link_stat.st_ino)
+        self.assertEqual((self.home / ".bashrc").read_text(), bashrc)
+        self.assertIn("Config     already", out)
+        self.assertIn("Command    already", out)
+        self.assertIn("Schedule   already", out)
+
+    def test_uninstall_denied_does_not_raise(self):
+        self.run_cli("install")
+        code, out = self.run_cli("uninstall", read=lambda: self.DENIED, platform="darwin")
+        self.assertNotEqual(code, 0)
+        self.assertIn("Cron entry failed", out)
+        self.assertIn("Full Disk Access", out)
+        self.assertIn("then run: sosmonitor uninstall", out)
+        self.assertFalse(self.link().exists())  # the other steps still ran
+
+    def test_uninstall_write_failure_does_not_raise(self):
+        self.run_cli("install")
+        code, out = self.run_cli("uninstall", write=lambda lines: (False, "disk full"))
+        self.assertNotEqual(code, 0)
+        self.assertIn("crontab: disk full", out)
+
+    def test_uninstall_success_summary(self):
+        self.run_cli("install")
+        code, out = self.run_cli("uninstall")
+        self.assertEqual(code, 0)
+        self.assertEqual(self.crontab.count(sm.CRON_MARK), 0)
+        for label in ("Cron entry", "Command", "PATH block"):
+            self.assertIn(label, out)
+
+    def test_run_and_test_without_config_create_nothing_and_fail(self):
+        for command in ("run", "test"):
+            with contextlib.redirect_stderr(io.StringIO()) as err:
+                code, out = self.run_cli(command)
+            self.assertNotEqual(code, 0)
+            self.assertFalse(self.config.exists())
+            self.assertFalse(self.config.parent.exists())
+            self.assertEqual(len(err.getvalue().strip().splitlines()), 1)
+            self.assertIn("install", err.getvalue())
+
+    def test_no_argument_means_run(self):
+        self.config.parent.mkdir()
+        self.config.write_text("{}")
+        with mock.patch.object(sm, "run_once") as run:
+            sm.main(["-c", str(self.config)])
+        run.assert_called_once()
 
 
 class MessageTests(unittest.TestCase):
@@ -401,7 +617,10 @@ class ShortcutTests(unittest.TestCase):
         return out.getvalue()
 
     def install(self):
-        return self.run_quiet(sm.install_shortcut)
+        """install_shortcut's result as text: status, detail and next steps."""
+        self.result = sm.install_shortcut()
+        status, detail, notes = self.result
+        return "\n".join([status, detail] + notes)
 
     def block_count(self, name):
         return (self.home / name).read_text().splitlines().count(sm.CRON_MARK)
@@ -438,7 +657,7 @@ class ShortcutTests(unittest.TestCase):
         for name, text in original.items():
             (self.home / name).write_text(text)
         self.install()
-        with mock.patch.object(sm, "uninstall_cron"):
+        with mock.patch.object(sm, "uninstall_cron", return_value=("already", "")):
             self.run_quiet(sm.cmd_uninstall)
         self.assertFalse(self.link.exists() or self.link.is_symlink())
         expected = dict(original, **{".bash_profile": "b=2\n"})  # newline added before the block
@@ -457,7 +676,9 @@ class ShortcutTests(unittest.TestCase):
         self.link.parent.mkdir(parents=True)
         self.link.write_text("mine")
         out = self.install()
-        self.assertIn("WARNING", out)
+        self.assertEqual(self.result[0], "manual")
+        self.assertIn("left it untouched", out)
+        self.assertIn(str(self.script), out)
         self.assertEqual(self.link.read_text(), "mine")
         self.assertFalse((self.home / ".bashrc").exists())
 
@@ -471,15 +692,15 @@ class ShortcutTests(unittest.TestCase):
     def test_failed_verification_prints_full_path(self):
         with mock.patch.object(sm, "shell_finds_command", return_value=False):
             out = self.install()
-        self.assertIn("WARNING", out)
+        self.assertIn("could not confirm", out)
         self.assertIn(str(self.link), out)
-        self.assertNotIn("Command installed", out)
         self.assertIn(sm.PATH_LINE, out)
 
     def test_install_wiring(self):
         cfg, path = make_cfg(), Path("/x/config.json")
-        with mock.patch.object(sm, "install_cron", return_value=0), \
-                mock.patch.object(sm, "install_shortcut") as shortcut:
+        with mock.patch.object(sm, "schedule_step", return_value=("ok", "every 5 minute(s)")), \
+                mock.patch.object(sm, "install_shortcut", return_value=SHORTCUT_OK) as shortcut, \
+                contextlib.redirect_stdout(io.StringIO()):
             sm.cmd_install(cfg, path)
             shortcut.assert_called_once()
             shortcut.reset_mock()
@@ -729,29 +950,44 @@ class TitleTests(MessageTests):
 
 
 class TopProcessTests(unittest.TestCase):
-    PS = ("  PID COMMAND            %MEM   RSS\n"
-          "    1 mysqld              6.1 1048576\n"
-          "    2 php-fpm: pool www   8.2 1363148\n"
-          "    3 node                2.4 404480\n"
-          "    4 weird/bin/secret-tool --password=hunter2 1.0 100\n")
+    PAGE = 4096
+    # pid: (comm as the kernel shows it, resident pages)
+    PROCS = {
+        1: ("mysqld", 256),
+        2: ("php-fpm: pool www", 332),
+        3: ("node", 98),
+        4: ("weird/bin/secret-tool --password=hunter2", 25),
+        5: ("tmux: server)(x", 40),  # parentheses inside the name
+    }
 
-    def ps(self, **kwargs):
-        defaults = dict(returncode=0, stdout=self.PS, stderr="")
-        defaults.update(kwargs)
-        return mock.patch.object(sm.subprocess, "run",
-                                 return_value=mock.Mock(**defaults))
+    def fake_proc(self, procs=None):
+        root = Path(tempfile.mkdtemp())
+        self.addCleanup(lambda: shutil.rmtree(root, ignore_errors=True))
+        for pid, (name, pages) in (procs or self.PROCS).items():
+            folder = root / str(pid)
+            folder.mkdir()
+            (folder / "statm").write_text(f"9999 {pages} 10 1 0 5 0\n")
+            (folder / "stat").write_text(f"{pid} ({name}) S 1 1 1 0 -1 4194560\n")
+        (root / "self").mkdir()  # non-numeric entries are ignored
+        return root
 
-    def memory(self, count=3):
+    def memory(self, count=3, root=None):
+        root = root or self.fake_proc()
         with mock.patch.object(sm, "psutil", None), \
+                mock.patch.object(sm, "PROC", str(root)), \
+                mock.patch.object(sm.os, "sysconf", create=True, return_value=self.PAGE), \
                 mock.patch.object(sm, "get_memory_usage",
                                   return_value={"total_bytes": 16 * 1024 ** 3}), \
-                self.ps():
-            return sm.top_memory(count)
+                mock.patch.object(sm.subprocess, "run") as run:
+            rows = sm.top_memory(count)
+        run.assert_not_called()  # no `ps`: works on busybox/Alpine
+        return rows
 
     def test_memory_ranked_by_rss_with_name_only(self):
         rows = self.memory()
         self.assertEqual(rows[0]["name"], "php-fpm:")  # largest rss first
-        self.assertEqual(rows[0]["rss_bytes"], 1363148 * 1024)
+        self.assertEqual(rows[0]["rss_bytes"], 332 * self.PAGE)
+        self.assertEqual(rows[0]["percent"], round(100.0 * 332 * self.PAGE / 16 / 1024 ** 3, 1))
         self.assertEqual(len(rows), 3)
 
     def test_names_never_carry_arguments(self):
@@ -759,7 +995,24 @@ class TopProcessTests(unittest.TestCase):
         names = " ".join(r["name"] for r in rows)
         self.assertNotIn("hunter2", names)
         self.assertNotIn("--password", names)
+        self.assertIn("tmux:", names)
         self.assertTrue(all(len(r["name"]) <= sm.TOP_NAME_WIDTH for r in rows))
+
+    def test_memory_skips_process_that_vanishes_mid_scan(self):
+        root = self.fake_proc()
+        (root / "2" / "statm").unlink()  # gone between listing and reading
+        names = [r["name"] for r in self.memory(count=10, root=root)]
+        self.assertNotIn("php-fpm:", names)
+        self.assertIn("mysqld", names)
+
+    def test_memory_with_missing_or_unreadable_proc_is_empty(self):
+        self.assertEqual(self.memory(root=Path(tempfile.gettempdir()) / "no-such-proc-dir"), [])
+        root = self.fake_proc()
+        with mock.patch.object(sm.os, "listdir", side_effect=PermissionError):
+            self.assertEqual(self.memory(root=root), [])
+        for pid in self.PROCS:  # every pid unreadable
+            (root / str(pid) / "stat").unlink()
+        self.assertEqual(self.memory(root=root), [])
 
     def test_cpu_from_proc_deltas_not_ps(self):
         first = {1: ("busy", 100), 2: ("idle", 5), 3: ("gone-later", 9)}
@@ -806,14 +1059,6 @@ class TopProcessTests(unittest.TestCase):
             with mock.patch.object(sm, "top_memory", side_effect=error):
                 self.assertEqual(sm.collect_top_processes(cfg, self.alerts_for("memory")), {})
 
-    def test_ps_missing_or_failing_gives_empty(self):
-        with mock.patch.object(sm, "psutil", None), \
-                mock.patch.object(sm.subprocess, "run", side_effect=FileNotFoundError):
-            with self.assertRaises(FileNotFoundError):
-                sm.top_memory(3)  # swallowed one level up, by collect_top_processes
-        with mock.patch.object(sm, "psutil", None), self.ps(returncode=1, stdout=""):
-            self.assertEqual(sm.top_memory(3), [])
-
     def test_alert_is_still_sent_when_lookup_fails(self):
         cfg = make_cfg(webhook=True)
         with mock.patch.object(sm, "top_memory", side_effect=OSError("denied")), \
@@ -859,6 +1104,292 @@ class NewConfigKeysTests(unittest.TestCase):
         path = tmp / "config.json"
         path.write_text(json.dumps({"top_processes": {"count": 5}}))
         self.assertEqual(sm.load_config(path)["top_processes"], {"enabled": True, "count": 5})
+
+
+class ConfigLocationTests(unittest.TestCase):
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(self.tmp.cleanup)
+        self.root = Path(self.tmp.name)
+        self.home = self.root / "home"
+        self.home.mkdir()
+        self.plain = self.root / "app"
+        self.pkg = self.root / "venv" / "lib" / "python3.12" / "site-packages"
+        for folder in (self.plain, self.pkg):
+            folder.mkdir(parents=True)
+
+    def resolve(self, script, explicit=None, platform="linux", **env):
+        env.setdefault("HOME", str(self.home))
+        with mock.patch.dict(sm.os.environ, env, clear=True), \
+                mock.patch.object(sm.Path, "home", return_value=self.home), \
+                mock.patch.object(sm.sys, "platform", platform), \
+                mock.patch.object(sm, "SCRIPT", script / "sosmonitor.py"):
+            return sm.resolve_config_path(explicit)
+
+    def test_explicit_config_wins_over_everything(self):
+        (self.pkg / "config.json").write_text("{}")
+        explicit = str(self.root / "other.json")
+        self.assertEqual(self.resolve(self.pkg, explicit), Path(explicit))
+
+    def test_config_next_to_script_beats_user_dir(self):
+        (self.pkg / "config.json").write_text("{}")
+        self.assertEqual(self.resolve(self.pkg), self.pkg / "config.json")
+
+    def test_package_uses_user_dir_xdg_and_fallback(self):
+        xdg = self.root / "xdg"
+        self.assertEqual(self.resolve(self.pkg, XDG_CONFIG_HOME=str(xdg)),
+                         xdg / "sosmonitor" / "config.json")
+        self.assertEqual(self.resolve(self.pkg),
+                         self.home / ".config" / "sosmonitor" / "config.json")
+
+    def test_dist_packages_counts_as_package(self):
+        deb = self.root / "usr" / "lib" / "python3" / "dist-packages"
+        deb.mkdir(parents=True)
+        self.assertEqual(self.resolve(deb), self.home / ".config" / "sosmonitor" / "config.json")
+
+    def test_package_on_windows_uses_appdata(self):
+        appdata = self.root / "AppData"
+        path = self.resolve(self.pkg, platform="win32", APPDATA=str(appdata))
+        self.assertEqual(path, appdata / "SOSMonitor" / "config.json")
+
+    def test_plain_script_without_config_uses_user_dir(self):
+        self.assertEqual(self.resolve(self.plain),
+                         self.home / ".config" / "sosmonitor" / "config.json")
+
+    def test_plain_script_with_config_beside_keeps_it(self):
+        (self.plain / "config.json").write_text("{}")
+        self.assertEqual(self.resolve(self.plain), self.plain / "config.json")
+
+    def test_log_state_lock_follow_resolved_config(self):
+        user_dir = self.root / "xdg" / "sosmonitor"
+        with mock.patch.dict(sm.os.environ, {"XDG_CONFIG_HOME": str(self.root / "xdg")}), \
+                mock.patch.object(sm, "SCRIPT", self.pkg / "sosmonitor.py"), \
+                mock.patch.object(sm, "crontab_read", return_value=("ok", "")), \
+                mock.patch.object(sm, "crontab_write", return_value=(True, "")), \
+                mock.patch.object(sm, "install_shortcut", return_value=SHORTCUT_OK):
+            code, out = cli("install")
+        self.assertEqual(code, 0)
+        self.assertTrue((user_dir / "config.json").exists())
+        cfg = sm.load_config(user_dir / "config.json")
+        for name in (sm.LOG_FILE, sm.STATE_FILE, sm.LOCK_FILE):
+            self.assertEqual(sm.file_in(cfg, name), user_dir / name)
+
+    def test_existing_files_are_never_moved_or_rewritten(self):
+        beside = self.pkg / "config.json"
+        beside.write_text('{ "server_name": "KEEP" }')
+        state = self.pkg / sm.STATE_FILE
+        state.write_text("{}")
+        before = {f.name: f.read_bytes() for f in (beside, state)}
+        with mock.patch.dict(sm.os.environ, {"XDG_CONFIG_HOME": str(self.root / "xdg")}), \
+                mock.patch.object(sm, "SCRIPT", self.pkg / "sosmonitor.py"), \
+                mock.patch.object(sm, "run_once"):
+            cli()
+        self.assertEqual({f.name: f.read_bytes() for f in (beside, state)}, before)
+        self.assertFalse((self.root / "xdg").exists())
+
+
+class FakeTerminal(io.StringIO):
+    interactive = True
+
+    def isatty(self):
+        return self.interactive
+
+
+class ConfigCommandTests(unittest.TestCase):
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(self.tmp.cleanup)
+        self.path = Path(self.tmp.name) / "sub" / "config.json"
+
+    def run_config(self, tty=True, env=None, which=lambda name: "/usr/bin/" + name,
+                   editor_effect=None, answers=()):
+        env = {"EDITOR": "", "VISUAL": ""} if env is None else env
+        out, err = FakeTerminal(), io.StringIO()
+        out.interactive = tty
+        with mock.patch.dict(sm.os.environ, env), \
+                mock.patch.object(sm.shutil, "which", side_effect=which), \
+                mock.patch.object(sm.sys.stdin, "isatty", return_value=tty), \
+                mock.patch("builtins.input", side_effect=list(answers)) as ask, \
+                mock.patch.object(sm.subprocess, "run", side_effect=editor_effect) as run, \
+                contextlib.redirect_stdout(out), contextlib.redirect_stderr(err):
+            code = sm.cmd_config(self.path)
+        return code, out.getvalue(), err.getvalue(), run, ask
+
+    def test_creates_missing_config_and_opens_editor(self):
+        code, out, _, run, _ = self.run_config(env={"EDITOR": "vim -u NONE", "VISUAL": ""})
+        self.assertEqual(code, 0)
+        self.assertTrue(self.path.exists())
+        self.assertIn("Config created", out)
+        run.assert_called_once_with(["vim", "-u", "NONE", str(self.path)])
+
+    def test_visual_beats_editor_then_nano_then_vi(self):
+        _, _, _, run, _ = self.run_config(env={"EDITOR": "vim", "VISUAL": "code -w"})
+        self.assertEqual(run.call_args[0][0][0], "code")
+        _, _, _, run, _ = self.run_config()
+        self.assertEqual(run.call_args[0][0][0], "nano")
+        _, _, _, run, _ = self.run_config(which=lambda n: "/bin/vi" if n == "vi" else None)
+        self.assertEqual(run.call_args[0][0][0], "vi")
+
+    def test_windows_falls_back_to_notepad(self):
+        with mock.patch.object(sm.sys, "platform", "win32"):
+            _, _, _, run, _ = self.run_config()
+        self.assertEqual(run.call_args[0][0][0], "notepad")
+
+    def test_without_tty_prints_path_and_command(self):
+        code, out, _, run, _ = self.run_config(tty=False, env={"EDITOR": "vim", "VISUAL": ""})
+        self.assertEqual(code, 0)
+        run.assert_not_called()
+        self.assertIn(str(self.path), out)
+        self.assertIn(f"vim {sm.shlex.quote(str(self.path))}", out)
+
+    def test_without_any_editor_prints_nano_command_and_never_opens(self):
+        code, out, _, run, _ = self.run_config(which=lambda name: None)
+        self.assertEqual(code, 0)
+        run.assert_not_called()
+        self.assertIn(f"nano {sm.shlex.quote(str(self.path))}", out)
+
+    def test_invalid_json_is_reported_and_reopen_offered(self):
+        def break_it(cmd, *a, **k):
+            Path(cmd[-1]).write_text("{ nope")
+        code, _, err, run, ask = self.run_config(editor_effect=break_it, answers=["y"])
+        self.assertEqual(code, 1)
+        self.assertEqual(run.call_count, 2)  # reopened once, then gave up
+        ask.assert_called_once()
+        self.assertEqual(err.count("Invalid config"), 2)
+        self.assertIn("Invalid JSON", err)
+
+    def test_fixed_on_second_try_succeeds(self):
+        texts = iter(["{ nope", '{"server_name": "X"}'])
+
+        def edit(cmd, *a, **k):
+            Path(cmd[-1]).write_text(next(texts))
+        code, out, _, run, _ = self.run_config(editor_effect=edit, answers=[""])
+        self.assertEqual(code, 0)
+        self.assertEqual(run.call_count, 2)
+        self.assertIn("Config OK", out)
+
+    def test_declining_reopen_stops(self):
+        def break_it(cmd, *a, **k):
+            Path(cmd[-1]).write_text("[]")
+        code, _, err, run, _ = self.run_config(editor_effect=break_it, answers=["n"])
+        self.assertEqual(code, 1)
+        run.assert_called_once()
+        self.assertIn("JSON object", err)
+
+    def test_cli_command_goes_through_main(self):
+        with mock.patch.object(sm, "cmd_config", return_value=0) as cmd:
+            code, _ = cli("-c", str(self.path), "config")
+        self.assertEqual(code, 0)
+        cmd.assert_called_once_with(self.path.resolve())
+
+
+class EntryPointInstallTests(unittest.TestCase):
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(self.tmp.cleanup)
+        root = Path(self.tmp.name)
+        self.home = root / "home"
+        (self.home / ".local" / "bin").mkdir(parents=True)
+        self.script = root / "venv" / "lib" / "site-packages" / "sosmonitor.py"
+        self.script.parent.mkdir(parents=True)
+        self.script.write_text("# package copy\n")
+        self.bin = root / "venv" / "bin"
+        self.bin.mkdir()
+        self.entry = self.bin / "sosmonitor"
+        self.entry.write_text("#!/bin/sh\n")
+        self.entry.chmod(0o755)
+        self.bashrc = self.home / ".bashrc"
+        self.bashrc.write_text("alias a=b\n")
+        for patch in (
+            mock.patch.dict(sm.os.environ, {"HOME": str(self.home),
+                                            "PATH": f"{self.bin}:/usr/bin"}),
+            mock.patch.object(sm, "SCRIPT", self.script),
+            mock.patch.object(sm.sys, "executable", str(self.bin / "python")),
+            mock.patch.object(sm, "shell_finds_command", return_value=True),
+        ):
+            patch.start()
+            self.addCleanup(patch.stop)
+        self.cfg = make_cfg()
+
+    def install(self, current=""):
+        out = io.StringIO()
+        with mock.patch.object(sm, "crontab_read", return_value=read_result(current)), \
+                mock.patch.object(sm, "crontab_write", return_value=(True, "")) as write, \
+                contextlib.redirect_stdout(out):
+            sm.cmd_install(self.cfg, Path("/srv/config.json"))
+        return write, out.getvalue()
+
+    def test_existing_command_means_no_link_and_no_startup_changes(self):
+        write, out = self.install()
+        self.assertFalse((self.home / ".local" / "bin" / "sosmonitor").exists())
+        self.assertEqual(self.bashrc.read_text(), "alias a=b\n")
+        self.assertEqual(sorted(p.name for p in self.home.iterdir()), [".bashrc", ".local"])
+        self.assertIn("Command    already   sosmonitor (", out)
+        self.assertEqual(self.script.read_text(), "# package copy\n")
+        self.assertFalse(self.script.stat().st_mode & 0o111)  # not chmod'ed either
+
+    def test_cron_line_calls_the_entry_point_with_absolute_path(self):
+        write, _ = self.install()
+        line = write.call_args[0][0][-1]
+        self.assertIn(f'"{self.entry}" -c "/srv/config.json" run', line)
+        self.assertNotIn("sosmonitor.py", line)
+
+    def test_cron_finds_entry_point_off_path(self):
+        with mock.patch.dict(sm.os.environ, {"PATH": "/usr/bin"}):
+            write, out = self.install()
+        self.assertIn(f'"{self.entry}" -c', write.call_args[0][0][-1])
+        self.assertNotIn("Command    already", out)  # off PATH: shortcut flow runs
+        self.assertTrue((self.home / ".local" / "bin" / "sosmonitor").is_symlink())
+
+    def test_without_entry_point_behavior_is_unchanged(self):
+        self.entry.unlink()
+        with mock.patch.object(sm.shutil, "which", return_value=None):
+            write, out = self.install()
+        self.assertIn(f'"{sys.executable}" "{self.script}" -c', write.call_args[0][0][-1])
+        self.assertTrue((self.home / ".local" / "bin" / "sosmonitor").is_symlink())
+        self.assertIn("Command    ok        sosmonitor (~/.local/bin/sosmonitor)", out)
+
+    def test_curl_install_ignores_package_lookup(self):
+        with mock.patch.object(sm, "SCRIPT", self.home / "mon" / "sosmonitor.py"):
+            self.assertIsNone(sm.find_entry_point())
+
+    def test_uninstall_leaves_alone_what_it_did_not_create(self):
+        self.bashrc.write_text(f"alias a=b\n{sm.CRON_MARK}\n{sm.PATH_LINE}\n")
+        before = self.bashrc.read_bytes()
+        with mock.patch.object(sm, "crontab_read", return_value=("ok", "")), \
+                contextlib.redirect_stdout(io.StringIO()):
+            sm.cmd_uninstall()
+        self.assertEqual(self.bashrc.read_bytes(), before)
+
+    def test_link_to_this_script_is_not_an_entry_point(self):
+        link = self.bin / "sosmonitor"
+        link.unlink()
+        link.symlink_to(self.script)
+        with mock.patch.object(sm.shutil, "which", return_value=str(link)), \
+                mock.patch.object(sm, "bin_dir", return_value=self.bin):
+            self.assertIsNone(sm.find_entry_point())
+            with contextlib.redirect_stdout(io.StringIO()):
+                sm.remove_shortcut()  # our own link is still removed
+        self.assertFalse(link.exists())
+
+
+class PackagingTests(unittest.TestCase):
+    def setUp(self):
+        self.text = (ROOT / "pyproject.toml").read_text(encoding="utf-8")
+
+    def test_metadata(self):
+        for needle in ('name = "sosmonitor"', 'requires-python = ">=3.8"',
+                       'sosmonitor = "sosmonitor:main"', 'py-modules = ["sosmonitor"]',
+                       'psutil = ["psutil>=5.9"]', "dependencies = []"):
+            self.assertIn(needle, self.text)
+
+    def test_version_comes_from_the_constant(self):
+        self.assertIn('version = {attr = "sosmonitor.VERSION"}', self.text)
+        self.assertNotRegex(self.text, r'(?m)^version\s*=\s*"')
+        self.assertRegex((ROOT / "sosmonitor.py").read_text(), r'(?m)^VERSION = "[^"]+"')
+
+    def test_changelog_has_current_version(self):
+        self.assertIn(f"## {sm.VERSION} ", (ROOT / "CHANGELOG.md").read_text())
 
 
 class LockTests(unittest.TestCase):
