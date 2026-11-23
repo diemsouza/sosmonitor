@@ -1152,6 +1152,114 @@ class UptimeTests(unittest.TestCase):
         self.assertEqual(alerts, [])
 
 
+class RebootTests(unittest.TestCase):
+    def up(self, boot_id="b1", boot_time=1000, seconds=300):
+        return {"uptime": {"seconds": seconds, "boot_time": boot_time, "boot_id": boot_id}}
+
+    def check(self, previous, **kw):
+        return sm.check_reboot(make_cfg(), previous, self.up(**kw))
+
+    def test_first_run_records_without_alert(self):
+        alert, boot = self.check(None)
+        self.assertIsNone(alert)
+        self.assertEqual(boot, {"id": "b1", "time": 1000})
+
+    def test_same_boot_id_no_alert_even_if_time_moves(self):
+        alert, _ = self.check({"id": "b1", "time": 5}, boot_time=99999)
+        self.assertIsNone(alert)
+
+    def test_new_boot_id_alerts_with_uptime(self):
+        alert, boot = self.check({"id": "b0", "time": 1000}, seconds=3 * 86400 + 4 * 3600 + 720)
+        self.assertEqual(alert["metric"], "reboot")
+        self.assertEqual((alert["threshold"], alert["previous_threshold"]), (0, 0))
+        self.assertEqual(alert["value"], 3 * 86400 + 4 * 3600 + 720)
+        self.assertEqual(alert["message"], "S restarted (up for 3d 4h 12m)")
+        self.assertEqual(boot["id"], "b1")
+
+    def test_boot_time_tolerance_without_boot_id(self):
+        previous = {"id": None, "time": 1000}
+        self.assertIsNone(self.check(previous, boot_id=None, boot_time=1060)[0])  # NTP drift
+        self.assertIsNone(self.check(previous, boot_id=None, boot_time=880)[0])
+        self.assertIsNotNone(self.check(previous, boot_id=None, boot_time=1300)[0])
+
+    def test_no_uptime_is_inert(self):
+        previous = {"id": "b1", "time": 1}
+        self.assertEqual(sm.check_reboot(make_cfg(), previous, cpu(5.0)), (None, previous))
+
+    def test_custom_message(self):
+        cfg = make_cfg()
+        cfg["reboot_message"] = "{server}: boot, {value}"
+        alert, _ = sm.check_reboot(cfg, {"id": "x", "time": 1}, self.up(seconds=60))
+        self.assertEqual(alert["message"], "S: boot, 1m")
+
+    def test_reboot_alert_with_recovery_alert_builds_message(self):
+        reboot, _ = self.check({"id": "b0", "time": 1})
+        recovery = {"metric": "cpu", "value": 12.5, "threshold": 0,
+                    "previous_threshold": 90, "message": "CPU ok"}
+        data = sm.build_payload(make_cfg(), cpu(12.5), [recovery, reboot])
+        self.assertIn("S restarted (up for 5m)", data["message_body"])
+
+    def test_old_state_files_load(self):
+        cfg = make_cfg()
+        path = sm.file_in(cfg, sm.STATE_FILE)
+        self.assertIsNone(sm.load_state(cfg)["boot"])
+        path.write_text(json.dumps({"levels": {"cpu": 70}}))
+        self.assertIsNone(sm.load_state(cfg)["boot"])
+        path.write_text(json.dumps({"boot": {"id": "b", "time": 3}}))
+        state = sm.load_state(cfg)
+        self.assertEqual(state["boot"], {"id": "b", "time": 3})
+        self.assertEqual(state["levels"], {})
+        path.write_text(json.dumps({"boot": "junk"}))
+        self.assertIsNone(sm.load_state(cfg)["boot"])
+
+
+class RebootRunTests(unittest.TestCase):
+    def setUp(self):
+        self.cfg = make_cfg(webhook=True)
+        self.state_path = sm.file_in(self.cfg, sm.STATE_FILE)
+
+    def run_once(self, boot_id, ok=True):
+        uptime = {"seconds": 120, "boot_time": 500, "boot_id": boot_id}
+        out = io.StringIO()
+        with mock.patch.object(sm, "measure_cpu", return_value=(5.0, None)), \
+                mock.patch.object(sm, "get_memory_usage", return_value=None), \
+                mock.patch.object(sm, "get_disk_usage", return_value=None), \
+                mock.patch.object(sm, "get_load_average", return_value=None), \
+                mock.patch.object(sm, "get_uptime", return_value=uptime), \
+                mock.patch.object(sm, "send_webhook", return_value=(ok, "x")) as hook, \
+                contextlib.redirect_stdout(out):
+            sm.run_once(self.cfg)
+        return json.loads(self.state_path.read_text()), hook, out.getvalue()
+
+    def test_update_then_reboot_then_quiet(self):
+        state, hook, out = self.run_once("b1")  # first run after update
+        self.assertEqual(state["boot"], {"id": "b1", "time": 500})
+        self.assertEqual(hook.call_args[0][1]["alerts"], [])
+        self.assertIn("UPTIME   2m", out)
+
+        state, hook, out = self.run_once("b2")  # rebooted
+        sent = hook.call_args[0][1]
+        self.assertEqual([a["metric"] for a in sent["alerts"]], ["reboot"])
+        self.assertIn("restarted (up for 2m)", sent["message_title"])
+        self.assertEqual(state["boot"]["id"], "b2")
+        self.assertIn("ALERT: S restarted (up for 2m)", out)
+
+        _, hook, _ = self.run_once("b2")  # same boot: nothing
+        self.assertEqual(hook.call_args[0][1]["alerts"], [])
+
+    def test_failed_delivery_retries_next_check(self):
+        self.run_once("b1")
+        state, _, _ = self.run_once("b2", ok=False)
+        self.assertEqual(state["boot"]["id"], "b1")
+        state, hook, _ = self.run_once("b2", ok=True)
+        self.assertEqual(hook.call_args[0][1]["alerts"][0]["metric"], "reboot")
+        self.assertEqual(state["boot"]["id"], "b2")
+
+    def test_failed_delivery_without_reboot_alert_still_records_boot(self):
+        state, _, _ = self.run_once("b1", ok=False)
+        self.assertEqual(state["boot"]["id"], "b1")
+
+
 class NewConfigKeysTests(unittest.TestCase):
     def test_old_config_without_new_keys_uses_defaults(self):
         tmp = Path(tempfile.mkdtemp())

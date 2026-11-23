@@ -11,6 +11,7 @@
     "100": "{metric} at {value}% (AT LIMIT)"
   },
   "recovery_message": "{metric} at {value}% (BACK TO NORMAL)",
+  "reboot_message": "{server} restarted (up for {value})",
   "top_processes": {
     "enabled": true,
     "count": 3

@@ -53,8 +53,9 @@ LOCK_FILE = ".sosmonitor.lock"
 PROC = "/proc"  # Linux process info; tests point it at a fake tree
 LOG_MAX_BYTES = 5_000_000
 TIMEOUT = 15
-METRIC_LABELS = {"cpu": "CPU", "memory": "Memory", "disk": "Disk"}
+METRIC_LABELS = {"cpu": "CPU", "memory": "Memory", "disk": "Disk", "reboot": "Reboot"}
 HYSTERESIS = 5  # points a value must fall below a level before it drops
+BOOT_TOLERANCE = 120  # seconds boot_time may drift (NTP, sleep) without being a reboot
 TASK_NAME = "SOSMonitor"  # Windows Task Scheduler
 TOP_TIMEOUT = 5  # seconds a top-processes lookup may take, at most
 TOP_NAME_WIDTH = 20
@@ -72,6 +73,7 @@ DEFAULTS: Dict[str, Any] = {
         "100": "{metric} at {value}% (AT LIMIT)",
     },
     "recovery_message": "{metric} at {value}% (BACK TO NORMAL)",
+    "reboot_message": "{server} restarted (up for {value})",
     "top_processes": {"enabled": True, "count": 3},
     "webhook": {"enabled": False, "url": "", "token": "", "token_header": "X-Monitor-Token"},
     "email": {
@@ -459,9 +461,16 @@ def format_message(template: str, server: str, metric: str, value: Any) -> str:
         return template
 
 
+def _valid_boot(boot: Any) -> Optional[dict]:
+    if (isinstance(boot, dict) and isinstance(boot.get("time"), (int, float))
+            and isinstance(boot.get("id"), (str, type(None)))):
+        return {"id": boot["id"], "time": boot["time"]}
+    return None
+
+
 def load_state(cfg: dict) -> dict:
-    """{"levels": ..., "pending": ..., "cpu_sample": ...}. A state file from
-    before 0.2.0 holds only the flat levels; it is read as `levels`."""
+    """{"levels": ..., "pending": ..., "cpu_sample": ..., "boot": ...}. A state
+    file from before 0.2.0 holds only the flat levels; it is read as `levels`."""
     try:
         raw = json.loads(file_in(cfg, STATE_FILE).read_text(encoding="utf-8"))
     except (OSError, json.JSONDecodeError):
@@ -469,7 +478,7 @@ def load_state(cfg: dict) -> dict:
     if not isinstance(raw, dict):
         raw = {}
 
-    if "levels" not in raw and "pending" not in raw and "cpu_sample" not in raw:
+    if not {"levels", "pending", "cpu_sample", "boot"} & raw.keys():
         raw = {"levels": raw}  # old flat format
     levels = raw.get("levels") if isinstance(raw.get("levels"), dict) else {}
     pending = raw.get("pending") if isinstance(raw.get("pending"), dict) else {}
@@ -479,6 +488,7 @@ def load_state(cfg: dict) -> dict:
                     if isinstance(v, dict) and isinstance(v.get("level"), int)
                     and isinstance(v.get("count"), int)},
         "cpu_sample": raw.get("cpu_sample") if _valid_sample(raw.get("cpu_sample")) else None,
+        "boot": _valid_boot(raw.get("boot")),
     }
 
 
@@ -555,6 +565,39 @@ def build_alerts(cfg: dict, metrics: dict, previous_state: dict,
         new_state[name] = current
 
     return alerts, new_state
+
+
+def check_reboot(cfg: dict, previous: Optional[dict],
+                 metrics: dict) -> Tuple[Optional[dict], Optional[dict]]:
+    """
+    (alert, boot to remember). The first run only records the boot, so an
+    update never sends a false reboot alert. Linux compares boot_id exactly;
+    elsewhere boot_time must move by more than BOOT_TOLERANCE seconds. With no
+    uptime reading (macOS/Windows without psutil) nothing happens.
+    """
+    uptime = metrics.get("uptime")
+    if not uptime:
+        return None, previous
+    current = {"id": uptime.get("boot_id"), "time": uptime["boot_time"]}
+    if previous is None:
+        return None, current
+
+    if previous["id"] and current["id"]:
+        rebooted = previous["id"] != current["id"]
+    else:
+        rebooted = abs(current["time"] - previous["time"]) > BOOT_TOLERANCE
+    if not rebooted:
+        return None, current
+
+    seconds = uptime["seconds"]
+    return {
+        "metric": "reboot",
+        "value": seconds,
+        "threshold": 0,
+        "previous_threshold": 0,
+        "message": format_message(cfg["reboot_message"], cfg["server_name"], "reboot",
+                                  human_uptime(seconds)),
+    }, current
 
 
 # ============================================================
@@ -798,6 +841,9 @@ def run_once(cfg: dict) -> None:
     metrics = collect_metrics(cfg, cpu_percent)
     pending = dict(state["pending"])
     alerts, levels = build_alerts(cfg, metrics, state["levels"], pending)
+    reboot, boot = check_reboot(cfg, state["boot"], metrics)
+    if reboot:
+        alerts.append(reboot)
     payload = build_payload(cfg, metrics, alerts, collect_top_processes(cfg, alerts))
     delivered, results = deliver(cfg, payload)
 
@@ -810,13 +856,14 @@ def run_once(cfg: dict) -> None:
         "duration_seconds": round(time.monotonic() - started, 2),
     })
 
-    # Two write rules: levels advance only if a channel succeeded (a failed
-    # alert is retried next run); the CPU sample and pending counters are
-    # saved on every run, since they are not tied to delivery.
+    # Two write rules: levels and boot advance only if a channel succeeded (a
+    # failed alert is retried next run); the CPU sample and pending counters
+    # are saved on every run, since they are not tied to delivery.
     save_state(cfg, {
         "levels": levels if delivered else state["levels"],
         "pending": pending,
         "cpu_sample": cpu_sample or state["cpu_sample"],
+        "boot": boot if delivered or not reboot else state["boot"],
     })
 
     print(f"SOSMonitor | {cfg['server_name']} | {payload['timestamp']}")
