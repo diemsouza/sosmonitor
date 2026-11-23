@@ -232,6 +232,34 @@ def get_load_average() -> Optional[dict]:
     }
 
 
+def _proc_uptime() -> Optional[dict]:
+    try:
+        with open(f"{PROC}/uptime", encoding="utf-8") as file:
+            seconds = float(file.read().split()[0])
+    except (OSError, ValueError, IndexError):
+        return None
+    try:
+        with open(f"{PROC}/sys/kernel/random/boot_id", encoding="utf-8") as file:
+            boot_id = file.read().strip() or None
+    except OSError:
+        boot_id = None
+    return {"seconds": int(seconds), "boot_time": int(time.time() - seconds), "boot_id": boot_id}
+
+
+def _psutil_uptime() -> Optional[dict]:
+    try:
+        boot_time = psutil.boot_time()
+    except (OSError, AttributeError):
+        return None
+    return {"seconds": max(0, int(time.time() - boot_time)), "boot_time": int(boot_time),
+            "boot_id": None}
+
+
+def get_uptime() -> Optional[dict]:
+    """Linux reads /proc (its boot_id changes on every boot); elsewhere psutil."""
+    return _proc_uptime() or (_psutil_uptime() if psutil else None)
+
+
 def _psutil_top_memory(deadline: float) -> Tuple[List[Tuple[str, int]], int]:
     """([(name, rss_bytes)], total memory in bytes)."""
     rows: List[Tuple[str, int]] = []
@@ -405,6 +433,7 @@ def collect_metrics(cfg: dict, cpu: Optional[float] = None) -> dict:
         "memory": get_memory_usage(),
         "disk": get_disk_usage(cfg["disk_path"]),
         "load": get_load_average(),
+        "uptime": get_uptime(),
     }
     return {name: data for name, data in readings.items() if data is not None}
 
@@ -704,10 +733,21 @@ def now_iso() -> str:
     return datetime.now(timezone.utc).astimezone().isoformat(timespec="seconds")
 
 
+def human_uptime(seconds: Any) -> str:
+    """3d 4h 12m; leading zero units are dropped, under a minute is 0m."""
+    minutes = max(0, int(seconds)) // 60
+    days, minutes = divmod(minutes, 1440)
+    hours, minutes = divmod(minutes, 60)
+    parts = ([f"{days}d"] if days else []) + ([f"{hours}h"] if days or hours else [])
+    return " ".join(parts + [f"{minutes}m"])
+
+
 def metric_items(metrics: dict) -> List[str]:
     items = []
     for name, data in metrics.items():
-        if name == "load":
+        if name == "uptime":
+            items.append(f"UPTIME {human_uptime(data['seconds'])}")
+        elif name == "load":
             items.append(f"LOAD 1m={data['1m']} 5m={data['5m']} "
                          f"15m={data['15m']} CPUs={data['cpu_count']}")
         else:

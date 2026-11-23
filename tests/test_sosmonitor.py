@@ -791,6 +791,7 @@ class RunOnceStateTests(unittest.TestCase):
                 mock.patch.object(sm, "get_memory_usage", return_value=None), \
                 mock.patch.object(sm, "get_disk_usage", return_value=None), \
                 mock.patch.object(sm, "get_load_average", return_value=None), \
+                mock.patch.object(sm, "get_uptime", return_value=None), \
                 mock.patch.object(sm, "collect_top_processes", return_value={}), \
                 mock.patch.object(sm, "send_webhook",
                                   return_value=(webhook_ok, "x")), \
@@ -1089,6 +1090,66 @@ class TopProcessTests(unittest.TestCase):
         top = {"cpu": [{"name": "php", "percent": 45.0}]}
         data = sm.build_payload(make_cfg(), cpu(95.0), ALERT, top)
         self.assertIn("Top processes by CPU:\n  1. php  45.0%\n", data["message_body"])
+
+
+class UptimeTests(unittest.TestCase):
+    def fake_proc(self, uptime="273120.55 1000.0\n", boot_id="abc-123\n"):
+        root = Path(tempfile.mkdtemp())
+        self.addCleanup(lambda: shutil.rmtree(root, ignore_errors=True))
+        if uptime is not None:
+            (root / "uptime").write_text(uptime)
+        if boot_id is not None:
+            (root / "sys" / "kernel" / "random").mkdir(parents=True)
+            (root / "sys" / "kernel" / "random" / "boot_id").write_text(boot_id)
+        return root
+
+    def read(self, root, psutil=None):
+        with mock.patch.object(sm, "PROC", str(root)), mock.patch.object(sm, "psutil", psutil):
+            return sm.get_uptime()
+
+    def test_linux_reads_proc(self):
+        with mock.patch.object(sm.time, "time", return_value=1_000_000.0):
+            up = self.read(self.fake_proc())
+        self.assertEqual(up, {"seconds": 273120, "boot_time": 726879,
+                              "boot_id": "abc-123"})
+
+    def test_proc_without_boot_id(self):
+        self.assertIsNone(self.read(self.fake_proc(boot_id=None))["boot_id"])
+
+    def test_psutil_when_there_is_no_proc(self):
+        fake = mock.Mock()
+        fake.boot_time.return_value = 900_000.0
+        with mock.patch.object(sm.time, "time", return_value=903_600.0):
+            up = self.read(self.fake_proc(uptime=None), psutil=fake)
+        self.assertEqual(up, {"seconds": 3600, "boot_time": 900_000, "boot_id": None})
+
+    def test_nothing_available_is_none(self):
+        self.assertIsNone(self.read(self.fake_proc(uptime=None)))
+        self.assertIsNone(self.read(self.fake_proc(uptime="garbage")))
+
+    def test_human_uptime(self):
+        self.assertEqual(sm.human_uptime(30), "0m")
+        self.assertEqual(sm.human_uptime(12 * 60), "12m")
+        self.assertEqual(sm.human_uptime(3600 + 5 * 60), "1h 5m")
+        self.assertEqual(sm.human_uptime(3 * 86400 + 4 * 3600 + 12 * 60), "3d 4h 12m")
+        self.assertEqual(sm.human_uptime(86400), "1d 0h 0m")
+
+    def test_metric_items_and_payload(self):
+        metrics = {**cpu(10.0), "uptime": {"seconds": 90060, "boot_time": 1, "boot_id": "x"}}
+        self.assertEqual(sm.metric_items(metrics), ["CPU 10%", "UPTIME 1d 1h 1m"])
+        self.assertEqual(sm.metric_lines(metrics)[1], "UPTIME   1d 1h 1m")
+        data = sm.build_payload(make_cfg(), metrics, ALERT)
+        self.assertEqual(data["metrics"]["uptime"]["seconds"], 90060)
+        self.assertIn("UPTIME 1d 1h 1m", data["message_body"])
+
+    def test_no_uptime_alerts_and_collect_includes_it(self):
+        cfg = make_cfg()
+        up = {"seconds": 5, "boot_time": 1, "boot_id": None}
+        with mock.patch.object(sm, "get_uptime", return_value=up):
+            metrics = sm.collect_metrics(cfg, 10.0)
+        self.assertEqual(metrics["uptime"], up)
+        alerts, _ = sm.build_alerts(cfg, metrics, {})
+        self.assertEqual(alerts, [])
 
 
 class NewConfigKeysTests(unittest.TestCase):
