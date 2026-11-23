@@ -2,6 +2,25 @@
 
 Every version lists what was added, changed and fixed, plus a **Config changes** line: keys that were added, renamed or removed in `config.json` ("none" when nothing changed). Keys missing from your `config.json` always use their default value, so a new key never breaks an old config. See [Updating](README.md#updating).
 
+## 0.4.0 - 2026-11-23
+
+### Added
+
+- **Reboot alert.** The first check after the server restarts sends an alert (`"metric": "reboot"`, threshold 0) saying it started and how long it has been up. It reuses the normal delivery path and retries on the next check if every channel fails. The first run after installing or updating only records the boot, so it never alerts falsely. Linux compares the kernel `boot_id`; macOS and Windows compare `psutil.boot_time()` with a 120 s tolerance, so NTP or sleep adjustments don't trigger it. Without `psutil` there it does nothing.
+- **Uptime metric** on every check (`metrics.uptime`: `seconds`, `boot_time`, `boot_id`), in the webhook payload, the log, the email and the console (`UPTIME 3d 4h 12m`). It has no threshold, like the load average.
+
+### Changed
+
+- **Breaking:** the webhook's `top_processes` is now a flat array with a `metric` on each item, instead of an object with a `cpu` and a `memory` list. Same rules: only when that metric alerts, never for disk. The email and console text is unchanged.
+- The README is shorter: the situational details moved to a FAQ at the end.
+- `sosmonitor_state.json` gains a `boot` key. Older state files load as before.
+
+### Fixed
+
+- Nothing.
+
+**Config changes:** new key `reboot_message` (default `"{server} restarted (up for {value})"`); missing from your config, the default is used. **Webhook contract change:** if your workflow reads `top_processes.cpu` or `top_processes.memory`, change it to filter the `top_processes` array by `metric == "cpu"` (or `"memory"`).
+
 ## 0.3.2 - 2026-11-21
 
 ### Changed

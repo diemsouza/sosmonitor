@@ -2,7 +2,7 @@
 """
 SOSMonitor: lightweight server monitor for hosts without root.
 
-Measures CPU, memory, disk and load average and sends alerts by webhook
+Measures CPU, memory, disk, load average and uptime and sends alerts by webhook
 and/or email when a threshold is crossed. Standard library only; psutil is
 used when installed.
 
@@ -44,7 +44,7 @@ try:
 except ImportError:
     psutil = None
 
-VERSION = "0.3.2"
+VERSION = "0.4.0"
 SCRIPT = Path(__file__).resolve()
 CRON_MARK = "# sosmonitor"
 LOG_FILE = "sosmonitor.log"
