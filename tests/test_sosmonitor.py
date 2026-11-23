@@ -579,7 +579,7 @@ class RunTestCommandTests(unittest.TestCase):
         hook.assert_not_called()
 
     def test_shows_top_processes_when_available(self):
-        top = {"memory": [{"name": "php-fpm", "percent": 8.2, "rss_bytes": 1395864371}]}
+        top = [{"metric": "memory", "name": "php-fpm", "percent": 8.2, "rss_bytes": 1395864371}]
         with mock.patch.object(sm, "collect_top_processes", return_value=top):
             code, out, _ = self.run_test(make_cfg())
         self.assertIn("Top processes by memory:", out)
@@ -792,7 +792,7 @@ class RunOnceStateTests(unittest.TestCase):
                 mock.patch.object(sm, "get_disk_usage", return_value=None), \
                 mock.patch.object(sm, "get_load_average", return_value=None), \
                 mock.patch.object(sm, "get_uptime", return_value=None), \
-                mock.patch.object(sm, "collect_top_processes", return_value={}), \
+                mock.patch.object(sm, "collect_top_processes", return_value=[]), \
                 mock.patch.object(sm, "send_webhook",
                                   return_value=(webhook_ok, "x")), \
                 contextlib.redirect_stdout(io.StringIO()):
@@ -800,7 +800,7 @@ class RunOnceStateTests(unittest.TestCase):
         return json.loads(self.state_path.read_text())
 
     def test_console_summary_lists_top_processes(self):
-        top = {"cpu": [{"name": "php-fpm", "percent": 62.5}]}
+        top = [{"metric": "cpu", "name": "php-fpm", "percent": 62.5}]
         out = io.StringIO()
         with mock.patch.object(sm, "collect_top_processes", return_value=top), \
                 mock.patch.object(sm, "measure_cpu", return_value=(95.0, None)), \
@@ -1039,10 +1039,10 @@ class TopProcessTests(unittest.TestCase):
         cfg = make_cfg()
         with mock.patch.object(sm, "top_memory", return_value=[{"name": "a"}]) as mem, \
                 mock.patch.object(sm, "top_cpu", return_value=[{"name": "b"}]) as cpu_:
-            self.assertEqual(sm.collect_top_processes(cfg, []), {})
-            self.assertEqual(sm.collect_top_processes(cfg, self.alerts_for("disk")), {})
+            self.assertEqual(sm.collect_top_processes(cfg, []), [])
+            self.assertEqual(sm.collect_top_processes(cfg, self.alerts_for("disk")), [])
             self.assertEqual(sm.collect_top_processes(cfg, self.alerts_for("memory")),
-                             {"memory": [{"name": "a"}]})
+                             [{"metric": "memory", "name": "a"}])
             mem.assert_called_once_with(3)
             cpu_.assert_not_called()
 
@@ -1051,9 +1051,9 @@ class TopProcessTests(unittest.TestCase):
         recovery = self.alerts_for("cpu")
         recovery[0]["threshold"] = 0
         with mock.patch.object(sm, "top_cpu") as top:
-            self.assertEqual(sm.collect_top_processes(cfg, recovery), {})
+            self.assertEqual(sm.collect_top_processes(cfg, recovery), [])
             cfg["top_processes"]["enabled"] = False
-            self.assertEqual(sm.collect_top_processes(cfg, self.alerts_for("cpu")), {})
+            self.assertEqual(sm.collect_top_processes(cfg, self.alerts_for("cpu")), [])
         top.assert_not_called()
 
     def test_failures_yield_no_list(self):
@@ -1061,7 +1061,7 @@ class TopProcessTests(unittest.TestCase):
         for error in (FileNotFoundError("ps"), PermissionError("hidepid"),
                       sm.subprocess.TimeoutExpired("ps", 3)):
             with mock.patch.object(sm, "top_memory", side_effect=error):
-                self.assertEqual(sm.collect_top_processes(cfg, self.alerts_for("memory")), {})
+                self.assertEqual(sm.collect_top_processes(cfg, self.alerts_for("memory")), [])
 
     def test_alert_is_still_sent_when_lookup_fails(self):
         cfg = make_cfg(webhook=True)
@@ -1074,9 +1074,9 @@ class TopProcessTests(unittest.TestCase):
         self.assertNotIn("Top processes", hook.call_args[0][1]["message_body"])
 
     def test_rendering_and_payload(self):
-        top = {"memory": [{"name": "php-fpm", "percent": 8.2, "rss_bytes": 1395864371},
-                          {"name": "mysqld", "percent": 6.1, "rss_bytes": 1073741824},
-                          {"name": "node", "percent": 2.4, "rss_bytes": 414187520}]}
+        top = [{"metric": "memory", "name": "php-fpm", "percent": 8.2, "rss_bytes": 1395864371},
+               {"metric": "memory", "name": "mysqld", "percent": 6.1, "rss_bytes": 1073741824},
+               {"metric": "memory", "name": "node", "percent": 2.4, "rss_bytes": 414187520}]
         data = sm.build_payload(make_cfg(), cpu(95.0), ALERT, top)
         self.assertEqual(data["top_processes"], top)
         self.assertIn("\nTop processes by memory:\n"
@@ -1086,8 +1086,21 @@ class TopProcessTests(unittest.TestCase):
         self.assertLess(data["message_body"].index("Top processes"),
                         data["message_body"].index("Current metrics"))
 
+    def test_flat_list_covers_both_metrics_and_groups_lines(self):
+        cfg = make_cfg()
+        with mock.patch.object(sm, "top_memory", return_value=[{"name": "m", "percent": 1.0}]), \
+                mock.patch.object(sm, "top_cpu", return_value=[{"name": "c", "percent": 2.0}]):
+            top = sm.collect_top_processes(
+                cfg, self.alerts_for("memory", "cpu", "memory"))  # duplicates collected once
+        self.assertEqual(top, [{"metric": "memory", "name": "m", "percent": 1.0},
+                               {"metric": "cpu", "name": "c", "percent": 2.0}])
+        lines = sm.top_process_lines(top + [{"metric": "memory", "name": "m2", "percent": 0.5}])
+        self.assertEqual([l for l in lines if l.startswith("Top")],
+                         ["Top processes by memory:", "Top processes by CPU:"])
+        self.assertEqual(lines.count("  2. m2  0.5%"), 1)
+
     def test_cpu_rendering(self):
-        top = {"cpu": [{"name": "php", "percent": 45.0}]}
+        top = [{"metric": "cpu", "name": "php", "percent": 45.0}]
         data = sm.build_payload(make_cfg(), cpu(95.0), ALERT, top)
         self.assertIn("Top processes by CPU:\n  1. php  45.0%\n", data["message_body"])
 

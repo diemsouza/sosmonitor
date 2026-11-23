@@ -610,28 +610,30 @@ def _clean_name(name: Any) -> str:
     return parts[0][:TOP_NAME_WIDTH] if parts else ""
 
 
-def collect_top_processes(cfg: dict, alerts: List[dict]) -> Dict[str, List[dict]]:
-    """Top consumers for the metrics that alerted (CPU and memory only).
-    Every failure is swallowed: the alert goes out without the list."""
+def collect_top_processes(cfg: dict, alerts: List[dict]) -> List[dict]:
+    """Top consumers for the metrics that alerted (CPU and memory only), as one
+    flat list with a `metric` on each row. Every failure is swallowed: the
+    alert goes out without the list."""
     settings = cfg["top_processes"]
     if not settings.get("enabled") or not alerts:
-        return {}
+        return []
     try:
         count = max(1, int(settings.get("count", 3)))
     except (TypeError, ValueError):
         count = 3
 
     finders = {"cpu": top_cpu, "memory": top_memory}
-    found: Dict[str, List[dict]] = {}
+    found: List[dict] = []
+    done = set()
     for alert in alerts:
         name = alert["metric"]
-        if name in finders and alert["threshold"] > 0 and name not in found:
+        if name in finders and alert["threshold"] > 0 and name not in done:
+            done.add(name)
             try:
                 rows = finders[name](count)
             except Exception:  # hidepid, no ps, permissions, anything
                 rows = []
-            if rows:
-                found[name] = rows
+            found += [{"metric": name, **row} for row in rows]
     return found
 
 
@@ -671,9 +673,12 @@ def human_bytes(size: float) -> str:
     return ""
 
 
-def top_process_lines(top: dict) -> List[str]:
+def top_process_lines(top: List[dict]) -> List[str]:
+    groups: Dict[str, List[dict]] = {}
+    for row in top:
+        groups.setdefault(row["metric"], []).append(row)
     lines: List[str] = []
-    for metric, rows in top.items():
+    for metric, rows in groups.items():
         lines += ["", f"Top processes by {'CPU' if metric == 'cpu' else 'memory'}:"]
         width = max(len(row["name"]) for row in rows)
         for number, row in enumerate(rows, 1):
@@ -703,7 +708,7 @@ def build_message(payload: dict) -> Tuple[str, str]:
     lines = [f"Server: {payload['server']}", f"Time: {payload['timestamp']}",
              "", "Alerts:"]
     lines += [f"  - {alert['message']}" for alert in alerts]
-    lines += top_process_lines(payload.get("top_processes", {}))
+    lines += top_process_lines(payload.get("top_processes", []))
     lines += ["", "Current metrics:", "  " + " | ".join(metric_items(payload["metrics"]))]
     return title, "\n".join(lines) + "\n"
 
@@ -808,7 +813,7 @@ def metric_lines(metrics: dict) -> List[str]:
 
 
 def build_payload(cfg: dict, metrics: dict, alerts: list,
-                  top_processes: Optional[dict] = None) -> dict:
+                  top_processes: Optional[List[dict]] = None) -> dict:
     payload = {
         "server": cfg["server_name"],
         "hostname": socket.gethostname(),
@@ -871,7 +876,7 @@ def run_once(cfg: dict) -> None:
         print(f"  {line}")
     for alert in alerts:
         print(f"  ALERT: {alert['message']}")
-    for line in top_process_lines(payload.get("top_processes", {})):
+    for line in top_process_lines(payload.get("top_processes", [])):
         print(f"  {line}" if line else "")
     for channel, result in results.items():
         print(f"  {channel}: {result}")
