@@ -5,10 +5,18 @@
   "send_every_check": true,
   "sustain_checks": 1,
   "thresholds": {
-    "70": "{metric} at {value}%",
-    "80": "{metric} at {value}% (WARNING)",
-    "90": "{metric} at {value}% (CRITICAL)",
-    "100": "{metric} at {value}% (AT LIMIT)"
+    "cpu": {
+      "80": "{metric} at {value}%",
+      "95": "{metric} at {value}% (CRITICAL)"
+    },
+    "memory": {
+      "80": "{metric} at {value}%",
+      "95": "{metric} at {value}% (CRITICAL)"
+    },
+    "disk": {
+      "95": "{metric} at {value}%",
+      "98": "{metric} at {value}% (ALMOST FULL)"
+    }
   },
   "recovery_message": "{metric} at {value}% (BACK TO NORMAL)",
   "reboot_message": "{server} restarted (up for {value})",

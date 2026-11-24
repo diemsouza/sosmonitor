@@ -44,7 +44,7 @@ try:
 except ImportError:
     psutil = None
 
-VERSION = "0.4.0"
+VERSION = "0.5.0"
 SCRIPT = Path(__file__).resolve()
 CRON_MARK = "# sosmonitor"
 LOG_FILE = "sosmonitor.log"
@@ -67,10 +67,18 @@ DEFAULTS: Dict[str, Any] = {
     "send_every_check": True,
     "sustain_checks": 1,
     "thresholds": {
-        "70": "{metric} at {value}%",
-        "80": "{metric} at {value}% (WARNING)",
-        "90": "{metric} at {value}% (CRITICAL)",
-        "100": "{metric} at {value}% (AT LIMIT)",
+        "cpu": {
+            "80": "{metric} at {value}%",
+            "95": "{metric} at {value}% (CRITICAL)",
+        },
+        "memory": {
+            "80": "{metric} at {value}%",
+            "95": "{metric} at {value}% (CRITICAL)",
+        },
+        "disk": {
+            "95": "{metric} at {value}%",
+            "98": "{metric} at {value}% (ALMOST FULL)",
+        },
     },
     "recovery_message": "{metric} at {value}% (BACK TO NORMAL)",
     "reboot_message": "{server} restarted (up for {value})",
@@ -118,6 +126,33 @@ def create_config(path: Path) -> None:
         pass
 
 
+THRESHOLD_METRICS = ("cpu", "memory", "disk")
+THRESHOLDS_HELP = (
+    'thresholds must be {"cpu": {"80": "message"}, "memory": {...}, "disk": {...}} '
+    '(or the older flat {"80": "message"}, which applies to all three)'
+)
+
+
+def _levels(levels: Any) -> List[Tuple[int, str]]:
+    return sorted((int(level), str(message)) for level, message in levels.items())
+
+
+def parse_thresholds(raw: Any) -> Dict[str, List[Tuple[int, str]]]:
+    """{metric: [(level, message), ...]}. Each metric has its own list; one
+    without an entry never alerts. The old flat format ({"70": "message"}) is
+    read as the same list for every metric."""
+    try:
+        if all(isinstance(value, dict) for value in raw.values()) and \
+                not any(str(key).strip().lstrip("-").isdigit() for key in raw):
+            if not set(raw) <= set(THRESHOLD_METRICS):
+                raise ValueError("unknown metric")
+            return {name: _levels(levels) for name, levels in raw.items()}
+        flat = _levels(raw)
+    except (AttributeError, TypeError, ValueError):
+        raise SystemExit(THRESHOLDS_HELP)
+    return {name: list(flat) for name in THRESHOLD_METRICS}
+
+
 def load_config(path: Path) -> dict:
     """Read-only: keys missing from the file fall back to DEFAULTS, and the
     file is never rewritten, so an old config keeps working after an update."""
@@ -130,14 +165,7 @@ def load_config(path: Path) -> dict:
 
     cfg = deep_merge(DEFAULTS, raw)
 
-    try:
-        cfg["thresholds"] = sorted(
-            (int(level), str(message)) for level, message in cfg["thresholds"].items()
-        )
-    except (AttributeError, TypeError, ValueError):
-        raise SystemExit(
-            'thresholds must be an object like {"70": "message", "80": "message"}'
-        )
+    cfg["thresholds"] = parse_thresholds(cfg["thresholds"])
 
     cfg["_dir"] = path.parent
     return cfg
@@ -520,7 +548,6 @@ def build_alerts(cfg: dict, metrics: dict, previous_state: dict,
     value falls HYSTERESIS points below it, so a value hovering around a
     threshold does not flap; dropping is never delayed.
     """
-    messages = dict(cfg["thresholds"])
     needed = sustain_checks(cfg)
     if pending is None:
         pending = {}
@@ -532,6 +559,7 @@ def build_alerts(cfg: dict, metrics: dict, previous_state: dict,
         if value is None:
             continue
 
+        messages = dict(cfg["thresholds"].get(name, ()))
         previous = previous_state.get(name, 0)
         current = max((level for level in messages if value >= level), default=0)
         if current < previous:

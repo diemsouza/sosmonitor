@@ -63,10 +63,18 @@ Created by `install` or `config` (`chmod 600`, since it holds passwords and toke
   "send_every_check": true,
   "sustain_checks": 1,
   "thresholds": {
-    "70": "{metric} at {value}%",
-    "80": "{metric} at {value}% (WARNING)",
-    "90": "{metric} at {value}% (CRITICAL)",
-    "100": "{metric} at {value}% (AT LIMIT)"
+    "cpu": {
+      "80": "{metric} at {value}%",
+      "95": "{metric} at {value}% (CRITICAL)"
+    },
+    "memory": {
+      "80": "{metric} at {value}%",
+      "95": "{metric} at {value}% (CRITICAL)"
+    },
+    "disk": {
+      "95": "{metric} at {value}%",
+      "98": "{metric} at {value}% (ALMOST FULL)"
+    }
   },
   "recovery_message": "{metric} at {value}% (BACK TO NORMAL)",
   "reboot_message": "{server} restarted (up for {value})",
@@ -86,12 +94,14 @@ Created by `install` or `config` (`chmod 600`, since it holds passwords and toke
 | `disk_path` | Partition to measure (`/`, `/home`, `C:\` ...) |
 | `send_every_check` | `true`: the webhook receives the metrics on every check. `false`: only when there is an alert. Email is only sent for alerts |
 | `sustain_checks` | Consecutive checks a metric must stay at or above a level before alerting. `1` (default) alerts at once; try `3` on noisy servers. Recovery is never delayed |
-| `thresholds` | Levels in % and the message for each. They apply to CPU, memory and disk. Your object **replaces** the default list, so include every level you want |
+| `thresholds` | Levels in % and the message for each, **separately for `cpu`, `memory` and `disk`**. Each metric has its own complete list; nothing is shared or inherited between them. A metric with no entry never alerts. Your object **replaces** the defaults, so include every metric and level you want. The old flat form (`{"70": "message"}`) still works and applies the same list to all three |
 | `recovery_message` | Sent when a metric goes back below the lowest level |
 | `reboot_message` | Sent on the first check after the server restarts. `{value}` is the uptime, like `12m` or `3d 4h 12m` |
 | `top_processes` | `enabled` and `count`: list the top CPU or memory consumers, only when that metric alerts |
 | `webhook` | `url` receives a JSON `POST`. `token`, if set, goes in the header named by `token_header` |
 | `email` | SMTP settings. Port 465 uses SSL; other ports use STARTTLS when offered. For Gmail use an [app password](https://myaccount.google.com/apppasswords). `to` is a list |
+
+**Why does disk have higher numbers?** CPU and memory spikes come and go, so 80 is an early heads-up and 95 means act now. Disk grows slowly and almost never comes back down by itself, so levels in between only add emails along the way, and a full disk *is* the failure: ext4 reserves 5% of blocks for root, so applications start breaking before the number reaches 100. 95 and 98 leave room to act without the noise.
 
 Placeholders: `{server}`, `{metric}` (CPU, Memory, Disk) and `{value}` (rounded %, or the uptime in `reboot_message`). Messages can be in any language. Keys missing from your file use their default.
 
@@ -99,22 +109,22 @@ Placeholders: `{server}`, `{metric}` (CPU, Memory, Disk) and `{value}` (rounded 
 
 SOSMonitor remembers the last level of each metric (in `sosmonitor_state.json`) and **only alerts when that level changes**:
 
-- **Going up is immediate.** 72% is level 70, 85% is level 80.
+- **Going up is immediate.** 83% is level 80, 96% is level 95.
 - **Going down needs a 5-point margin**, so a value hovering around a threshold doesn't alternate alerts and recoveries.
 - **CPU is an average since the previous check**, which matches your host's graph and ignores a burst from another cron job. The first check after install or a reboot takes a 1-second sample.
 - **Reboots** alert once: the first check after the server restarts says it started and for how long. It never fires on the first run after installing or updating.
 
-Example with levels 70 and 80:
+Example with CPU levels 80 and 95:
 
 | Check | Value | Level | Alert |
 | --- | --- | --- | --- |
-| 1 | 65% | 0 | – |
-| 2 | 71% | 70 | **"CPU at 71%"** |
-| 3 | 69% | 70 | – (still within 70 − 5) |
-| 4 | 83% | 80 | **"CPU at 83% (WARNING)"** |
-| 5 | 77% | 80 | – (still within 80 − 5) |
-| 6 | 74% | 70 | **"CPU at 74%"** |
-| 7 | 64% | 0 | **"CPU at 64% (BACK TO NORMAL)"** |
+| 1 | 75% | 0 | – |
+| 2 | 81% | 80 | **"CPU at 81%"** |
+| 3 | 77% | 80 | – (still within 80 − 5) |
+| 4 | 96% | 95 | **"CPU at 96% (CRITICAL)"** |
+| 5 | 91% | 95 | – (still within 95 − 5) |
+| 6 | 88% | 80 | **"CPU at 88%"** |
+| 7 | 70% | 0 | **"CPU at 70% (BACK TO NORMAL)"** |
 
 Load average and uptime are collected and sent on every check but have no thresholds, so they never alert by themselves.
 
@@ -123,18 +133,18 @@ Load average and uptime are collected and sent on every check but have no thresh
 Every alert goes to every enabled channel; if all fail, it is retried on the next check. The title shows **only the most severe alert** plus a counter; the body lists them all:
 
 ```
-[SOSMonitor] MY-SERVER: Memory at 85% (WARNING) (+1 more)
+[SOSMonitor] MY-SERVER: Memory at 96% (CRITICAL) (+1 more)
 
 Alerts:
-  - Memory at 85% (WARNING)
-  - CPU at 75%
+  - Memory at 96% (CRITICAL)
+  - CPU at 83%
 
 Top processes by memory:
   1. php-fpm  8.2% (1.3 GB)
   2. mysqld   6.1% (1.0 GB)
 
 Current metrics:
-  CPU 75% | MEMORY 85% | DISK 54% | UPTIME 3d 4h 12m
+  CPU 83% | MEMORY 96% | DISK 54% | UPTIME 3d 4h 12m
 ```
 
 Top processes are looked up only when a CPU or memory alert goes out, by command name only, never arguments. If the host hides them, the alert is sent without the list.
@@ -153,10 +163,10 @@ The webhook receives this JSON:
     "load": { "1m": 1.2, "5m": 0.9, "15m": 0.7, "cpu_count": 2, "1m_per_cpu": 0.6 },
     "uptime": { "seconds": 273120, "boot_time": 1763400000, "boot_id": "5d0f1c2e-3b4a-4c6d-8e7f-0a1b2c3d4e5f" }
   },
-  "alerts": [{ "metric": "cpu", "value": 83.0, "threshold": 80, "previous_threshold": 70,
-               "message": "CPU at 83% (WARNING)" }],
+  "alerts": [{ "metric": "cpu", "value": 83.0, "threshold": 80, "previous_threshold": 0,
+               "message": "CPU at 83%" }],
   "top_processes": [{ "metric": "cpu", "name": "php-fpm", "percent": 62.5 }],
-  "message_title": "[SOSMonitor] MY-SERVER: CPU at 83% (WARNING)",
+  "message_title": "[SOSMonitor] MY-SERVER: CPU at 83%",
   "message_body": "Server: MY-SERVER\n..."
 }
 ```

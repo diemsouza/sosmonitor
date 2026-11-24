@@ -26,11 +26,21 @@ def read_result(current):
     return ("unavailable", "") if current is None else ("ok", current)
 
 
-def make_cfg(webhook=False, email=False, every_check=True):
+LEGACY = {
+    "70": "{metric} at {value}%",
+    "80": "{metric} at {value}% (WARNING)",
+    "90": "{metric} at {value}% (CRITICAL)",
+    "100": "{metric} at {value}% (AT LIMIT)",
+}  # old flat format, for tests that need these exact levels
+
+
+def make_cfg(webhook=False, email=False, every_check=True, thresholds=None):
     tmp = Path(tempfile.mkdtemp())
     path = tmp / "config.json"
     data = sm.build_template("S")
     data["send_every_check"] = every_check
+    if thresholds is not None:
+        data["thresholds"] = thresholds
     data["webhook"]["enabled"] = webhook
     data["email"]["enabled"] = email
     path.write_text(json.dumps(data))
@@ -58,7 +68,7 @@ def cli(*argv):
 
 class AlertTests(unittest.TestCase):
     def setUp(self):
-        self.cfg = make_cfg()
+        self.cfg = make_cfg(thresholds=LEGACY)
 
     def test_escalation_uses_level_message(self):
         alerts, state = sm.build_alerts(self.cfg, cpu(85.0), {})
@@ -92,7 +102,7 @@ class AlertTests(unittest.TestCase):
 
 class HysteresisTests(unittest.TestCase):
     def setUp(self):
-        self.cfg = make_cfg()  # levels 70/80/90/100, margin 5
+        self.cfg = make_cfg(thresholds=LEGACY)  # levels 70/80/90/100, margin 5
 
     def level(self, value, previous):
         alerts, state = sm.build_alerts(self.cfg, cpu(value), {"cpu": previous})
@@ -248,11 +258,55 @@ class ConfigTests(unittest.TestCase):
         run.assert_called_once()
         self.assertEqual(json.loads(self.path.read_text()), {"server_name": "CUSTOM"})
 
-    def test_user_thresholds_replace_defaults(self):
+    def test_default_thresholds_are_per_metric(self):
+        self.path.write_text("{}")
+        cfg = sm.load_config(self.path)
+        self.assertEqual([level for level, _ in cfg["thresholds"]["cpu"]], [80, 95])
+        self.assertEqual([level for level, _ in cfg["thresholds"]["memory"]], [80, 95])
+        self.assertEqual([level for level, _ in cfg["thresholds"]["disk"]], [95, 98])
+
+    def test_flat_thresholds_apply_to_all_three_metrics(self):
         self.path.write_text(json.dumps({"thresholds": {"95": "alto", "60": "médio"}}))
         cfg = sm.load_config(self.path)
-        self.assertEqual(cfg["thresholds"], [(60, "médio"), (95, "alto")])
+        expected = [(60, "médio"), (95, "alto")]
+        self.assertEqual(cfg["thresholds"],
+                         {"cpu": expected, "memory": expected, "disk": expected})
         self.assertIs(cfg["webhook"]["enabled"], False)
+
+    def test_nested_thresholds_replace_defaults_entirely(self):
+        self.path.write_text(json.dumps({"thresholds": {"cpu": {"50": "a"}, "disk": {"90": "b", "85": "c"}}}))
+        cfg = sm.load_config(self.path)
+        self.assertEqual(cfg["thresholds"],
+                         {"cpu": [(50, "a")], "disk": [(85, "c"), (90, "b")]})
+
+    def test_metric_without_thresholds_never_alerts(self):
+        cfg = make_cfg(thresholds={"cpu": {"50": "a"}})
+        metrics = {"cpu": {"percent": 60.0}, "memory": {"percent": 99.0}, "disk": {"percent": 99.0}}
+        alerts, _ = sm.build_alerts(cfg, metrics, {})
+        self.assertEqual([a["metric"] for a in alerts], ["cpu"])
+
+    def test_each_metric_uses_its_own_levels(self):
+        cfg = make_cfg()
+        metrics = {"cpu": {"percent": 96.0}, "memory": {"percent": 82.0}, "disk": {"percent": 90.0}}
+        alerts, state = sm.build_alerts(cfg, metrics, {})
+        self.assertEqual({a["metric"]: a["threshold"] for a in alerts}, {"cpu": 95, "memory": 80})
+        self.assertEqual(state["disk"], 0)
+        metrics["disk"]["percent"] = 98.5
+        alerts, _ = sm.build_alerts(cfg, {"disk": metrics["disk"]}, {})
+        self.assertEqual(alerts[0]["message"], "Disk at 99% (ALMOST FULL)")
+
+    def test_flat_thresholds_apply_to_disk_in_alerts(self):
+        cfg = make_cfg(thresholds=LEGACY)
+        alerts, _ = sm.build_alerts(cfg, {"disk": {"percent": 72.0}}, {})
+        self.assertEqual(alerts[0]["threshold"], 70)
+
+    def test_bad_threshold_shapes(self):
+        for bad in ({"load": {"80": "x"}}, {"cpu": {"abc": "x"}}, {"cpu": "x"},
+                    {"cpu": {"80": "x"}, "90": "y"}, ["x"]):
+            self.path.write_text(json.dumps({"thresholds": bad}))
+            with self.assertRaises(SystemExit) as error:
+                sm.load_config(self.path)
+            self.assertIn("thresholds", str(error.exception))
 
     def test_default_config_is_created_in_user_dir_by_install(self):
         xdg = Path(self.tmp.name) / "xdg"
@@ -817,7 +871,7 @@ class RunOnceStateTests(unittest.TestCase):
 
     def test_successful_delivery_advances_levels(self):
         state = self.run_once(webhook_ok=True)
-        self.assertEqual(state["levels"], {"cpu": 90})
+        self.assertEqual(state["levels"], {"cpu": 95})
         self.assertEqual(state["cpu_sample"]["total"], 2.0)
 
     def test_failed_delivery_keeps_previous_levels(self):
@@ -825,12 +879,12 @@ class RunOnceStateTests(unittest.TestCase):
         self.assertEqual(self.run_once(webhook_ok=False)["levels"], {"cpu": 70})
 
     def test_old_flat_state_still_loads_and_is_migrated(self):
-        self.state_path.write_text(json.dumps({"cpu": 90, "memory": 70}))
+        self.state_path.write_text(json.dumps({"cpu": 95, "memory": 80}))
         state = sm.load_state(self.cfg)
-        self.assertEqual(state["levels"], {"cpu": 90, "memory": 70})
+        self.assertEqual(state["levels"], {"cpu": 95, "memory": 80})
         self.assertIsNone(state["cpu_sample"])
-        saved = self.run_once(webhook_ok=True)  # cpu stays at 90: no alert
-        self.assertEqual(saved["levels"], {"cpu": 90, "memory": 70})
+        saved = self.run_once(webhook_ok=True)  # cpu stays at 95: no alert
+        self.assertEqual(saved["levels"], {"cpu": 95, "memory": 80})
         self.assertIn("cpu_sample", saved)
 
     def test_missing_or_corrupt_state(self):
@@ -845,13 +899,13 @@ class SustainTests(unittest.TestCase):
         return alerts, levels
 
     def cfg_with(self, n):
-        cfg = make_cfg()
+        cfg = make_cfg(thresholds=LEGACY)
         cfg["sustain_checks"] = n
         return cfg
 
     def test_default_alerts_immediately(self):
         self.assertEqual(make_cfg()["sustain_checks"], 1)
-        alerts, _ = self.check(make_cfg(), 75.0, {}, {})
+        alerts, _ = self.check(make_cfg(thresholds=LEGACY), 75.0, {}, {})
         self.assertEqual(len(alerts), 1)
 
     def test_three_alerts_on_third_consecutive_check(self):

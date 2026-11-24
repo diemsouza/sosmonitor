@@ -2,6 +2,23 @@
 
 Every version lists what was added, changed and fixed, plus a **Config changes** line: keys that were added, renamed or removed in `config.json` ("none" when nothing changed). Keys missing from your `config.json` always use their default value, so a new key never breaks an old config. See [Updating](README.md#updating).
 
+## 0.5.0 - 2026-11-23
+
+### Added
+
+- **Thresholds per metric.** `thresholds` now has a `cpu`, `memory` and `disk` entry, each with its own complete list of levels and messages. There is no shared list and no inheritance: what is in the file is what runs, and a metric without an entry never alerts.
+
+### Changed
+
+- **New defaults:** CPU and memory alert at 80 and 95, disk at 95 and 98 (`ALMOST FULL`). The 70 and 100 levels are gone. 70% CPU was almost always a one-minute peak that was normal by the next check, 100 never added anything after 95, and a disk at 70% is a normal, stable state. `sustain_checks` stays at 1, so alerts are still immediate.
+- `config.example.json` and the config created by `install` carry the three lists.
+
+### Fixed
+
+- Nothing.
+
+**Config changes:** `thresholds` accepts the new per-metric format. The old flat format (`{"70": "message", ...}`) still works and applies to all three metrics, so existing configs behave as before and keep their levels until you edit them.
+
 ## 0.4.0 - 2026-11-23
 
 ### Added
